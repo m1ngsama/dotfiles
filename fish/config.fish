@@ -3,9 +3,13 @@ if status is-interactive
 end
 
 # fisher
+## you should install fisher first via next line command
+## curl -sL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish | source && fisher install jorgebucaran/fisher
 set -Ux fish_user_paths $fish_user_paths /usr/local/bin
 
 # brew
+## you should install brew first via next line command
+## /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 set -g PATH /opt/homebrew/bin $PATH
 
 # mysql 
@@ -17,6 +21,7 @@ set -Ux PATH $PATH $GOPATH/bin
 
 thefuck --alias | source
 
+# fish_greeting replaced by maxim
 function fish_greeting
     echo 'Talk is cheap. Show me the code.' | lolcat -a -d 10
 end
