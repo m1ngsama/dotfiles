@@ -1,0 +1,6 @@
+# manual in chinese ver
+alias cman="man -L zh_CN"
+
+# eza
+alias all="eza -alh --icons --group-directories-first --time-style=long-iso --total-size"
+
