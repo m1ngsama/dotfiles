@@ -5,5 +5,9 @@ size = 16.0
 family = "JetBrains Mono Nerd Font"
 style = "Regular"
 
+# You need install fonts first
+# sudo pacman -S yay
+# yay -S nerd-fonts-jetbrains-mono
+
 [window]
 opacity = 0.7
