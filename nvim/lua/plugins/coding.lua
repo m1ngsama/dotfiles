@@ -78,20 +78,25 @@ return {
 		end,
 	},
 
+	-- Use aerial.nvim instead of symbols-outline (more actively maintained)
 	{
-		"simrat39/symbols-outline.nvim",
-		keys = { { "<leader>cs", "<cmd>SymbolsOutline<cr>", desc = "Symbols Outline" } },
-		cmd = "SymbolsOutline",
+		"stevearc/aerial.nvim",
+		keys = { { "<leader>cs", "<cmd>AerialToggle<cr>", desc = "Symbols Outline (Aerial)" } },
+		cmd = "AerialToggle",
 		opts = {
-			position = "right",
+			layout = {
+				default_direction = "right",
+			},
+			attach_mode = "global",
 		},
 	},
 
-	{
-		"nvim-cmp",
-		dependencies = { "hrsh7th/cmp-emoji" },
-		opts = function(_, opts)
-			table.insert(opts.sources, { name = "emoji" })
-		end,
-	},
+	-- Disabled: using blink.cmp instead
+	-- {
+	-- 	"nvim-cmp",
+	-- 	dependencies = { "hrsh7th/cmp-emoji" },
+	-- 	opts = function(_, opts)
+	-- 		table.insert(opts.sources, { name = "emoji" })
+	-- 	end,
+	-- },
 }

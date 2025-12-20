@@ -66,7 +66,7 @@ require("lazy").setup({
 			disabled_plugins = {
 				"gzip",
 				-- "matchit",
-				-- "matchparen",
+				"matchparen", -- using vim-matchup or other alternatives
 				"netrwPlugin",
 				"rplugin",
 				"tarPlugin",
