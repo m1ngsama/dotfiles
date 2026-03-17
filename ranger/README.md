@@ -16,8 +16,21 @@ sudo pacman -S --needed \
   perl-image-exiftool w3m mpv trash-cli unrar poppler imagemagick bat jq file
 ```
 
+## Install
+
+```bash
+./scripts/install-ranger.sh
+```
+
+Useful options:
+
+- `./scripts/install-ranger.sh --dry-run`
+- `./scripts/install-ranger.sh --copy`
+- `./scripts/install-ranger.sh --target-dir ~/.config/ranger`
+
 ## Notes
 
 - `preview_images_method ueberzug` works well in X11 terminals such as Alacritty.
 - `chafa` provides a readable fallback when graphical image previews are unavailable.
 - `trash-cli` powers the `dt` and `dT` key bindings in `rc.conf`.
+- Existing `rc.conf` and `scope.sh` files are backed up under `~/.local/state/dotfiles-backups/ranger/`.

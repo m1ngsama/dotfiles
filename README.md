@@ -15,3 +15,9 @@
 - [ranger](https://github.com/ranger/ranger)
 
 - Custom keymap files
+
+## Quick start
+
+```bash
+./scripts/install-ranger.sh
+```
