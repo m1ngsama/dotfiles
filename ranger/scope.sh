@@ -162,20 +162,21 @@ handle_image() {
     ;;
 
   ## Video
-  # video/*)
-  #     # Thumbnail
-  #     ffmpegthumbnailer -i "${FILE_PATH}" -o "${IMAGE_CACHE_PATH}" -s 0 && exit 6
-  #     exit 1;;
+  video/*)
+    ffmpegthumbnailer -i "${FILE_PATH}" -o "${IMAGE_CACHE_PATH}" -s 0 && exit 6
+    exit 1
+    ;;
 
   ## PDF
-  # application/pdf)
-  #     pdftoppm -f 1 -l 1 \
-  #              -scale-to-x "${DEFAULT_SIZE%x*}" \
-  #              -scale-to-y -1 \
-  #              -singlefile \
-  #              -jpeg -tiffcompression jpeg \
-  #              -- "${FILE_PATH}" "${IMAGE_CACHE_PATH%.*}" \
-  #         && exit 6 || exit 1;;
+  application/pdf)
+    pdftoppm -f 1 -l 1 \
+      -scale-to-x "${DEFAULT_SIZE%x*}" \
+      -scale-to-y -1 \
+      -singlefile \
+      -jpeg -tiffcompression jpeg \
+      -- "${FILE_PATH}" "${IMAGE_CACHE_PATH%.*}" &&
+      exit 6 || exit 1
+    ;;
 
   ## ePub, MOBI, FB2 (using Calibre)
   # application/epub+zip|application/x-mobipocket-ebook|\
@@ -331,8 +332,8 @@ handle_mime() {
 
   ## Image
   image/*)
-    ## Preview as text conversion
-    # img2txt --gamma=0.6 --width="${PV_WIDTH}" -- "${FILE_PATH}" && exit 4
+    chafa --animate=off --size="${PV_WIDTH}x${PV_HEIGHT}" \
+      --symbols=block -- "${FILE_PATH}" && exit 4
     exiftool "${FILE_PATH}" && exit 5
     exit 1
     ;;

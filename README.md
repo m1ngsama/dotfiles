@@ -2,9 +2,9 @@
 
 “工欲善其事，必先利其器。”
 
-> Dotfile of the tools what I use.
+> Dotfiles for the tools I use.
 
-## Including
+## Includes
 
 - [fish](https://github.com/fish-shell/fish-shell)
 
@@ -12,5 +12,6 @@
 
 - [tmux](https://github.com/tmux/tmux)
 
-- Customed Keymaps Files
+- [ranger](https://github.com/ranger/ranger)
 
+- Custom keymap files
