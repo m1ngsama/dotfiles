@@ -1,0 +1,3030 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root" || exit 1
+# shellcheck disable=SC1091
+source "$repo_root/scripts/lib/safety.bash"
+
+failures=0
+skips=0
+strict=${DOTFILES_CHECK_STRICT:-0}
+
+pass() {
+  printf 'ok   %s\n' "$1"
+}
+
+fail() {
+  printf 'FAIL %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+skip() {
+  printf 'skip %s\n' "$1"
+  skips=$((skips + 1))
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+run() {
+  local description=$1
+  local status
+  shift
+
+  # Invoke outside an if/&& conditional so a check's own `set -e` remains
+  # effective. Bash otherwise disables errexit throughout called functions.
+  "$@"
+  status=$?
+  if ((status == 0)); then
+    pass "$description"
+  else
+    fail "$description"
+  fi
+  return 0
+}
+
+optional() {
+  local command_name=$1
+  local description=$2
+  shift 2
+
+  if have "$command_name"; then
+    run "$description" "$@"
+  elif [[ $strict == 1 ]]; then
+    fail "$description (missing: $command_name)"
+  else
+    skip "$description (missing: $command_name)"
+  fi
+}
+
+check_no_personal_paths() {
+  local output
+
+  if ! have rg; then
+    return 127
+  fi
+
+  output=$(rg -n --hidden \
+    --glob '!.git/**' \
+    '(^|[^[:alnum:]_}])\/(Users|home)\/[[:alnum:]_.-]+\/' . 2>/dev/null) || {
+    local status=$?
+    [[ $status == 1 ]] && return 0
+    return "$status"
+  }
+
+  printf '%s\n' "$output" >&2
+  return 1
+}
+
+check_repository_whitespace() {
+  git diff --check || return 1
+  git diff --cached --check || return 1
+
+  python3 - <<'PY'
+import os
+import pathlib
+import subprocess
+
+listed = subprocess.run(
+    ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+problems = []
+
+for encoded in listed.split(b"\0"):
+    if not encoded:
+        continue
+    relative = os.fsdecode(encoded)
+    path = pathlib.Path(relative)
+    if path.is_symlink() or not path.is_file():
+        continue
+    data = path.read_bytes()
+    if b"\0" in data:
+        continue
+    for number, line in enumerate(data.splitlines(keepends=True), start=1):
+        body = line.rstrip(b"\r\n")
+        if body.endswith((b" ", b"\t")):
+            problems.append(f"{relative}:{number}: trailing whitespace")
+    if data and not data.endswith(b"\n"):
+        problems.append(f"{relative}: missing final newline")
+
+if problems:
+    raise SystemExit("\n".join(problems))
+PY
+}
+
+check_fish() {
+  local file
+  local -a files=()
+
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find home/dot_config/fish -type f -name '*.fish' -print0 | LC_ALL=C sort -z)
+
+  if ((${#files[@]} != 14)); then
+    printf 'expected 14 Fish files, found %d\n' "${#files[@]}" >&2
+    return 1
+  fi
+
+  for file in "${files[@]}"; do
+    fish -n "$file" || return 1
+  done
+}
+
+check_fish_format() {
+  local -a owned_files=(
+    home/dot_config/fish/config.fish
+    home/dot_config/fish/conf.d/00_xdg_defaults.fish
+    home/dot_config/fish/conf.d/eza.fish
+    home/dot_config/fish/conf.d/m1ng_ghq_key_bindings.fish
+    home/dot_config/fish/conf.d/zoxide.fish
+    home/dot_config/fish/functions/__m1ng_ghq_repository_search.fish
+    home/dot_config/fish/functions/fish_prompt.fish
+  )
+
+  # nvm.fish is pinned third-party source. Check its syntax, but never rewrite
+  # or enforce local formatting on it.
+  fish_indent --check "${owned_files[@]}"
+}
+
+check_fish_xdg_defaults() (
+  set -euo pipefail
+
+  local fish_parent
+  local fish_root
+
+  fish_parent=${TMPDIR:-/tmp}
+  fish_parent=$(cd -P -- "$fish_parent" && pwd -P)
+  fish_root=$(mktemp -d "$fish_parent/dotfiles-fish.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$fish_root" "$fish_parent" dotfiles-fish.' EXIT HUP INT TERM
+  mkdir -p -- "$fish_root/home"
+  cd "$fish_root"
+
+  # Fish expands these variables inside its own single-quoted command.
+  # shellcheck disable=SC2016
+  env -i \
+    HOME="$fish_root/home" \
+    PATH="$PATH" \
+    DOTFILES_REPO_ROOT="$repo_root" \
+    XDG_CONFIG_HOME= \
+    XDG_DATA_HOME=relative/data \
+    XDG_STATE_HOME=relative/state \
+    XDG_CACHE_HOME= \
+    fish --no-config -c '
+      source "$DOTFILES_REPO_ROOT/home/dot_config/fish/conf.d/00_xdg_defaults.fish"
+      test "$XDG_CONFIG_HOME" = "$HOME/.config"
+      and test "$XDG_DATA_HOME" = "$HOME/.local/share"
+      and test "$XDG_STATE_HOME" = "$HOME/.local/state"
+      and test "$XDG_CACHE_HOME" = "$HOME/.cache"
+      and source "$DOTFILES_REPO_ROOT/home/dot_config/fish/conf.d/nvm.fish"
+      and test "$nvm_data" = "$HOME/.local/share/nvm"
+    '
+)
+
+check_legacy_fish_manifest() {
+  python3 - <<'PY'
+import pathlib
+
+manifest = pathlib.Path("scripts/legacy-fish-paths")
+paths = manifest.read_text(encoding="utf-8").splitlines()
+if len(paths) != 96 or paths != sorted(set(paths)):
+    raise SystemExit("legacy Fish manifest must contain 96 sorted unique paths")
+if ".config/fish/fish_variables" in paths:
+    raise SystemExit("mutable fish_variables must never be in the automatic cleanup manifest")
+
+current_root = pathlib.Path("home/dot_config/fish")
+current = {
+    ".config/fish/" + path.relative_to(current_root).as_posix()
+    for path in current_root.rglob("*")
+    if path.is_file()
+}
+for relative in paths:
+    path = pathlib.PurePosixPath(relative)
+    if path.is_absolute() or ".." in path.parts or path.parts[:2] != (".config", "fish"):
+        raise SystemExit(f"unsafe legacy Fish path: {relative}")
+    if relative in current:
+        raise SystemExit(f"legacy Fish path overlaps current source state: {relative}")
+PY
+}
+
+check_fish_go_path() (
+  set -euo pipefail
+
+  local fish_executable
+  local fish_parent
+  local fish_root
+  local fish_home
+  local first_gopath
+  local second_gopath
+  local gobin
+
+  fish_executable=$(command -v fish)
+  [[ $fish_executable == /* ]]
+
+  fish_parent=${TMPDIR:-/tmp}
+  fish_parent=$(cd -P -- "$fish_parent" && pwd -P)
+  fish_root=$(mktemp -d "$fish_parent/dotfiles-fish-go.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$fish_root" "$fish_parent" dotfiles-fish-go.' EXIT HUP INT TERM
+
+  fish_home="$fish_root/home"
+  first_gopath="$fish_root/go-first"
+  second_gopath="$fish_root/go-second"
+  gobin="$fish_root/gobin"
+  mkdir -p -- \
+    "$fish_home/go/bin" \
+    "$first_gopath/bin" \
+    "$second_gopath/bin" \
+    "$gobin"
+
+  # --no-config excludes host integrations; fish_add_path records its global
+  # additions in fish_user_paths, which normal Fish startup projects into PATH.
+  # Fish expands these variables inside its own single-quoted command.
+  # shellcheck disable=SC2016
+  env -i \
+    HOME="$fish_home" \
+    PATH="$PATH" \
+    DOTFILES_REPO_ROOT="$repo_root" \
+    GOBIN="$gobin" \
+    GOPATH="$first_gopath:$second_gopath" \
+    "$fish_executable" --no-config -c '
+      source "$DOTFILES_REPO_ROOT/home/dot_config/fish/config.fish"
+      test (count $GOPATH) -eq 2
+      and contains -- "$GOBIN" $fish_user_paths
+      and not contains -- "$GOPATH[1]/bin" $fish_user_paths
+      and not contains -- "$GOPATH[2]/bin" $fish_user_paths
+    ' || return 1
+
+  # shellcheck disable=SC2016
+  env -i \
+    HOME="$fish_home" \
+    PATH="$PATH" \
+    DOTFILES_REPO_ROOT="$repo_root" \
+    GOBIN= \
+    GOPATH="$first_gopath:$second_gopath" \
+    "$fish_executable" --no-config -c '
+      source "$DOTFILES_REPO_ROOT/home/dot_config/fish/config.fish"
+      test (count $GOPATH) -eq 2
+      and contains -- "$GOPATH[1]/bin" $fish_user_paths
+      and not contains -- "$GOPATH[2]/bin" $fish_user_paths
+    ' || return 1
+
+  # shellcheck disable=SC2016
+  env -i \
+    HOME="$fish_home" \
+    PATH="$PATH" \
+    DOTFILES_REPO_ROOT="$repo_root" \
+    GOBIN=relative/bin \
+    GOPATH= \
+    "$fish_executable" --no-config -c '
+      source "$DOTFILES_REPO_ROOT/home/dot_config/fish/config.fish"
+      contains -- "$HOME/go/bin" $fish_user_paths
+    ' || return 1
+)
+
+check_fish_prompt_behavior() (
+  set -euo pipefail
+
+  local prompt_parent
+  local prompt_root
+  local prompt_home
+  local prompt_repo
+  local prompt_outside
+  local prompt_file
+  local prompt_command
+  local prompt_template
+  local output
+  local blob
+  local detached
+
+  prompt_parent=${TMPDIR:-/tmp}
+  prompt_parent=$(cd -P -- "$prompt_parent" && pwd -P)
+  prompt_root=$(mktemp -d "$prompt_parent/dotfiles-fish-prompt.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$prompt_root" "$prompt_parent" dotfiles-fish-prompt.' EXIT HUP INT TERM
+
+  prompt_home="$prompt_root/home"
+  prompt_repo="$prompt_root/repo"
+  prompt_outside="$prompt_root/outside"
+  prompt_file="$repo_root/home/dot_config/fish/functions/fish_prompt.fish"
+  prompt_template="$prompt_root/git-template"
+  # Fish, not Bash, expands the two environment variables in this command.
+  # shellcheck disable=SC2016
+  prompt_command='cd "$DOTFILES_PROMPT_DIR"; source "$DOTFILES_PROMPT_FILE"; fish_prompt'
+  mkdir -p -- "$prompt_home" "$prompt_repo" "$prompt_outside" "$prompt_template"
+
+  unset \
+    GIT_COMMON_DIR \
+    GIT_CONFIG \
+    GIT_CONFIG_COUNT \
+    GIT_CONFIG_PARAMETERS \
+    GIT_DIR \
+    GIT_INDEX_FILE \
+    GIT_OBJECT_DIRECTORY \
+    GIT_WORK_TREE
+  export GIT_ATTR_NOSYSTEM=1
+  export GIT_CONFIG_GLOBAL=/dev/null
+  export GIT_CONFIG_NOSYSTEM=1
+  export GIT_NO_REPLACE_OBJECTS=1
+  export GIT_TERMINAL_PROMPT=0
+  export GIT_CONFIG_COUNT=3
+  export GIT_CONFIG_KEY_0=core.hooksPath
+  export GIT_CONFIG_VALUE_0=/dev/null
+  export GIT_CONFIG_KEY_1=core.fsmonitor
+  export GIT_CONFIG_VALUE_1=false
+  export GIT_CONFIG_KEY_2=core.attributesFile
+  export GIT_CONFIG_VALUE_2=/dev/null
+
+  git -C "$prompt_repo" -c init.defaultBranch=benchmark \
+    init --quiet --template="$prompt_template"
+  git -C "$prompt_repo" \
+    -c user.name='Dotfiles prompt test' \
+    -c user.email=prompt-test@example.invalid \
+    -c commit.gpgsign=false \
+    commit --quiet --allow-empty --no-verify -m baseline
+
+  output=$(env \
+    HOME="$prompt_home" \
+    TERM=dumb \
+    DOTFILES_PROMPT_DIR="$prompt_outside" \
+    DOTFILES_PROMPT_FILE="$prompt_file" \
+    fish --no-config -c "$prompt_command")
+  [[ $output != *' git:('* ]]
+
+  output=$(env \
+    HOME="$prompt_home" \
+    TERM=dumb \
+    DOTFILES_PROMPT_DIR="$prompt_repo" \
+    DOTFILES_PROMPT_FILE="$prompt_file" \
+    fish --no-config -c "$prompt_command")
+  [[ $output == *' git:(benchmark)'* && $output != *' * '* ]]
+
+  blob=$(printf 'staged change\n' | git -C "$prompt_repo" hash-object -w --stdin)
+  git -C "$prompt_repo" update-index --add --cacheinfo "100644,$blob,tracked"
+  output=$(env \
+    HOME="$prompt_home" \
+    TERM=dumb \
+    DOTFILES_PROMPT_DIR="$prompt_repo" \
+    DOTFILES_PROMPT_FILE="$prompt_file" \
+    fish --no-config -c "$prompt_command")
+  [[ $output == *' git:(benchmark) *'* ]]
+
+  git -C "$prompt_repo" checkout --quiet --detach
+  detached=$(git -C "$prompt_repo" rev-parse --short=7 HEAD)
+  output=$(env \
+    HOME="$prompt_home" \
+    TERM=dumb \
+    DOTFILES_PROMPT_DIR="$prompt_repo" \
+    DOTFILES_PROMPT_FILE="$prompt_file" \
+    fish --no-config -c "$prompt_command")
+  [[ $output == *" git:($detached) *"* ]]
+)
+
+check_performance_benchmark() (
+  set -euo pipefail
+
+  local output
+  output=$(
+    "$repo_root/scripts/benchmark" \
+      --samples 1 \
+      --warmups 0 \
+      --nvim-samples 1
+  )
+
+  grep -Fq 'Fish core startup:' <<<"$output"
+  grep -Fq 'Fish configured startup:' <<<"$output"
+  grep -Fq 'Prompt outside Git:' <<<"$output"
+  grep -Fq 'Prompt in small Git repo:' <<<"$output"
+  grep -Fq 'Prompt in 5k-file repo:' <<<"$output"
+  grep -Fq 'Active configured Fish integrations:' <<<"$output"
+  grep -Fq 'No absolute pass/fail budget is applied.' <<<"$output"
+)
+
+check_lua() {
+  local file
+
+  while IFS= read -r -d '' file; do
+    luac -p "$file" || return 1
+  done < <(find home/dot_config/nvim -type f -name '*.lua' -print0)
+  luac -p scripts/nvim-first-start.lua
+  luac -p scripts/nvim-preflight.lua
+}
+
+check_hsl_colors() {
+  lua - <<'LUA'
+local hsl = dofile("home/dot_config/nvim/lua/m1ngsama/hsl.lua")
+
+local function assert_close(actual, expected)
+  assert(math.abs(actual - expected) < 1e-12, ("expected %s, got %s"):format(expected, actual))
+end
+
+local short = hsl.hex_to_rgb("#abc")
+assert_close(short[1], 170 / 255)
+assert_close(short[2], 187 / 255)
+assert_close(short[3], 204 / 255)
+assert(hsl.hexToHSL("#fff") == "hsl(0, 0, 100)")
+assert(hsl.hexToHSL("#ff0000") == "hsl(0, 100, 50)")
+assert(hsl.hslToHex(0, 100, 50) == "#ff0000")
+
+local line = "short=#abc long=#112233 alpha=#11223344 malformed=#12 identifier=#abcdefg"
+local expected = "short=hsl(210, 25, 73) long=hsl(210, 50, 13) alpha=#11223344 malformed=#12 identifier=#abcdefg"
+assert(hsl.replace_hex_colors(line) == expected)
+
+for _, invalid in ipairs({ "#12", "#1234", "#1234567", "#12345678", "not-a-color" }) do
+  assert(not pcall(hsl.hex_to_rgb, invalid), "unexpectedly accepted " .. invalid)
+end
+LUA
+}
+
+check_nvim_api() {
+  DOTFILES_REPO_ROOT="$repo_root" nvim --clean --headless -u NONE \
+    --cmd 'lua local version = vim.version(); assert(version.major > 0 or version.minor >= 12)' \
+    --cmd 'lua local hsl = dofile(vim.env.DOTFILES_REPO_ROOT .. "/" .. "home/dot_config/nvim/lua/m1ngsama/hsl.lua"); assert(hsl.hexToHSL("#fff") == "hsl(0, 0, 100)")' \
+    --cmd 'lua local spec = dofile(vim.env.DOTFILES_REPO_ROOT .. "/" .. "home/dot_config/nvim/lua/plugins/treesitter.lua"); spec[1].init(); assert(vim.filetype.match({ filename = "test.mdx" }) == "mdx")' \
+    --cmd 'lua local original = vim.uv.os_uname; vim.uv.os_uname = function() return { sysname = "Linux", machine = "aarch64" } end; local spec = dofile(vim.env.DOTFILES_REPO_ROOT .. "/" .. "home/dot_config/nvim/lua/plugins/lsp.lua"); vim.uv.os_uname = original; local mason = { ensure_installed = {} }; spec[1].opts(nil, mason); assert(not vim.tbl_contains(mason.ensure_installed, "selene")); assert(not vim.tbl_contains(mason.ensure_installed, "clangd")); local lint = { linters_by_ft = {} }; spec[2].opts(nil, lint); assert(vim.deep_equal(lint.linters_by_ft.lua, { "luacheck" })); assert(spec[3].opts.servers.clangd.mason == false)' \
+    --cmd 'lua local lsp = dofile(vim.env.DOTFILES_REPO_ROOT .. "/" .. "home/dot_config/nvim/lua/m1ngsama/lsp.lua"); lsp.toggleInlayHints()' \
+    +qa
+}
+
+check_nvim_setup_lock_and_signal() (
+  set -euo pipefail
+
+  local setup_parent
+  local setup_root
+  local fake_bin
+  local owner_state
+  local owner_home
+  local owner_events
+  local owner_mkdir_marker
+  local owner_mkdir_release
+  local owner_marker
+  local owner_release
+  local owner_log
+  local contender_log
+  local owner_lock
+  local owner_pid=
+  local owner_status
+  local contender_pid=
+  local contender_status
+  local term_state
+  local term_home
+  local term_events
+  local term_marker
+  local term_release
+  local term_log
+  local term_lock
+  local term_pid=
+  local term_status
+  local term_child_pid
+  local real_mkdir
+
+  wait_for_setup_marker() {
+    local marker=$1
+    local pid=$2
+    local count
+
+    for ((count = 0; count < 300; count++)); do
+      [[ -e $marker ]] && return 0
+      kill -0 "$pid" 2>/dev/null || return 1
+      sleep 0.1
+    done
+    return 1
+  }
+
+  # shellcheck disable=SC2317,SC2329
+  cleanup_nvim_setup_test() {
+    local pid
+    local marker
+    local child_pid
+
+    for pid in "$owner_pid" "$contender_pid" "$term_pid"; do
+      [[ -n $pid ]] || continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    [[ -z $owner_mkdir_release ]] || : >"$owner_mkdir_release"
+    [[ -z $owner_release ]] || : >"$owner_release"
+    for pid in "$owner_pid" "$contender_pid" "$term_pid"; do
+      [[ -n $pid ]] || continue
+      wait "$pid" 2>/dev/null || true
+    done
+    for marker in "$owner_marker" "$term_marker"; do
+      [[ -f $marker ]] || continue
+      child_pid=$(<"$marker")
+      [[ $child_pid =~ ^[0-9]+$ ]] || continue
+      kill -TERM "$child_pid" 2>/dev/null || true
+    done
+    dotfiles_safe_cleanup_tree "$setup_root" "$setup_parent" dotfiles-nvim-setup-test.
+  }
+
+  # shellcheck disable=SC2317,SC2329
+  exit_nvim_setup_test_for_signal() {
+    local status=$1
+
+    trap - HUP INT TERM
+    cleanup_nvim_setup_test
+    trap - EXIT
+    exit "$status"
+  }
+
+  setup_parent=${TMPDIR:-/tmp}
+  setup_parent=$(cd -P -- "$setup_parent" && pwd -P)
+  real_mkdir=$(command -v mkdir)
+  [[ $real_mkdir == /* ]]
+  setup_root=$(mktemp -d "$setup_parent/dotfiles-nvim-setup-test.XXXXXXXX")
+  fake_bin="$setup_root/bin"
+  owner_state="$setup_root/owner-state"
+  owner_home="$setup_root/owner-home"
+  owner_events="$setup_root/owner-events"
+  owner_mkdir_marker="$setup_root/owner-lock-created"
+  owner_mkdir_release="$setup_root/owner-lock-release"
+  owner_marker="$setup_root/owner-preflight-child"
+  owner_release="$setup_root/owner-release"
+  owner_log="$setup_root/owner.log"
+  contender_log="$setup_root/contender.log"
+  owner_lock="$owner_state/nvim/dotfiles-setup.lock"
+  term_state="$setup_root/term-state"
+  term_home="$setup_root/term-home"
+  term_events="$setup_root/term-events"
+  term_marker="$setup_root/term-preflight-child"
+  term_release="$setup_root/term-release"
+  term_log="$setup_root/term.log"
+  term_lock="$term_state/nvim/dotfiles-setup.lock"
+  mkdir -p -- "$fake_bin" "$owner_home" "$term_home"
+  : >"$owner_events"
+  : >"$term_events"
+
+  trap cleanup_nvim_setup_test EXIT
+  trap 'exit_nvim_setup_test_for_signal 129' HUP
+  trap 'exit_nvim_setup_test_for_signal 130' INT
+  trap 'exit_nvim_setup_test_for_signal 143' TERM
+
+  # This fake never loads configuration or accesses the network. A preflight
+  # records its child PID and blocks until released. If a locking regression
+  # lets a second setup reach preflight, it records that violation and exits
+  # immediately instead of making the test hang.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'is_preflight=0' \
+    'for argument in "$@"; do' \
+    '  [[ $argument != --clean ]] || is_preflight=1' \
+    'done' \
+    'if ((is_preflight == 0)); then' \
+    '  printf "provision\\t%s\\n" "$$" >>"$DOTFILES_TEST_EVENTS"' \
+    '  exit 0' \
+    'fi' \
+    'printf "preflight\\t%s\\n" "$$" >>"$DOTFILES_TEST_EVENTS"' \
+    'if [[ -e $DOTFILES_TEST_MARKER ]]; then' \
+    '  exit 91' \
+    'fi' \
+    'printf "%s\\n" "$$" >"$DOTFILES_TEST_MARKER"' \
+    'on_term() {' \
+    '  printf "child-term\\t%s\\n" "$$" >>"$DOTFILES_TEST_EVENTS"' \
+    '  exit 143' \
+    '}' \
+    'trap on_term TERM' \
+    'for ((index = 0; index < 300; index++)); do' \
+    '  [[ ! -e $DOTFILES_TEST_RELEASE ]] || exit 0' \
+    '  sleep 0.1' \
+    'done' \
+    'exit 124' \
+    >"$fake_bin/nvim"
+  chmod 0755 "$fake_bin/nvim"
+
+  # Reproduce the narrow ownership window exactly: the real mkdir has created
+  # an empty setup lock, but setup-nvim has not yet observed success, marked
+  # lock_owned, or written its PID. A losing contender's EXIT cleanup must not
+  # remove that empty directory from underneath the owner.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'is_setup_lock=0' \
+    'for argument in "$@"; do' \
+    '  case $argument in' \
+    '    */dotfiles-setup.lock) is_setup_lock=1 ;;' \
+    '  esac' \
+    'done' \
+    '"$DOTFILES_TEST_REAL_MKDIR" "$@"' \
+    'status=$?' \
+    '((status == 0)) || exit "$status"' \
+    'if ((is_setup_lock == 1)) && [[ -n ${DOTFILES_TEST_MKDIR_MARKER:-} ]]; then' \
+    '  : >"$DOTFILES_TEST_MKDIR_MARKER"' \
+    '  for ((index = 0; index < 300; index++)); do' \
+    '    [[ ! -e $DOTFILES_TEST_MKDIR_RELEASE ]] || exit 0' \
+    '    sleep 0.1' \
+    '  done' \
+    '  exit 124' \
+    'fi' \
+    'exit 0' \
+    >"$fake_bin/mkdir"
+  chmod 0755 "$fake_bin/mkdir"
+
+  PATH="$fake_bin:$PATH" \
+    HOME="$owner_home" \
+    XDG_STATE_HOME="$owner_state" \
+    DOTFILES_TEST_EVENTS="$owner_events" \
+    DOTFILES_TEST_REAL_MKDIR="$real_mkdir" \
+    DOTFILES_TEST_MKDIR_MARKER="$owner_mkdir_marker" \
+    DOTFILES_TEST_MKDIR_RELEASE="$owner_mkdir_release" \
+    DOTFILES_TEST_MARKER="$owner_marker" \
+    DOTFILES_TEST_RELEASE="$owner_release" \
+    "$repo_root/scripts/setup-nvim" >"$owner_log" 2>&1 &
+  owner_pid=$!
+  wait_for_setup_marker "$owner_mkdir_marker" "$owner_pid"
+  [[ -d $owner_lock && ! -e $owner_lock/pid && ! -L $owner_lock/pid ]]
+  [[ -z $(find "$owner_lock" -mindepth 1 -maxdepth 1 -print -quit) ]]
+  [[ ! -s $owner_events ]]
+
+  PATH="$fake_bin:$PATH" \
+    HOME="$owner_home" \
+    XDG_STATE_HOME="$owner_state" \
+    DOTFILES_TEST_EVENTS="$owner_events" \
+    DOTFILES_TEST_REAL_MKDIR="$real_mkdir" \
+    DOTFILES_TEST_MKDIR_MARKER="$owner_mkdir_marker" \
+    DOTFILES_TEST_MKDIR_RELEASE="$owner_mkdir_release" \
+    DOTFILES_TEST_MARKER="$owner_marker" \
+    DOTFILES_TEST_RELEASE="$owner_release" \
+    "$repo_root/scripts/setup-nvim" >"$contender_log" 2>&1 &
+  contender_pid=$!
+  if wait "$contender_pid"; then
+    contender_status=0
+  else
+    contender_status=$?
+  fi
+  contender_pid=
+
+  [[ $contender_status != 0 ]]
+  [[ -d $owner_lock && ! -e $owner_lock/pid && ! -L $owner_lock/pid ]]
+  [[ -z $(find "$owner_lock" -mindepth 1 -maxdepth 1 -print -quit) ]]
+  [[ ! -s $owner_events ]]
+  grep -Fq 'Another Neovim setup may be active' "$contender_log"
+
+  : >"$owner_mkdir_release"
+  wait_for_setup_marker "$owner_marker" "$owner_pid"
+  [[ -d $owner_lock && -f $owner_lock/pid ]]
+  [[ $(<"$owner_lock/pid") == "$owner_pid" ]]
+  [[ $(grep -c '^preflight' "$owner_events") == 1 ]]
+
+  : >"$owner_release"
+  if wait "$owner_pid"; then
+    owner_status=0
+  else
+    owner_status=$?
+  fi
+  owner_pid=
+
+  [[ $owner_status == 0 ]]
+  [[ $(grep -c '^preflight' "$owner_events") == 1 ]]
+  [[ $(grep -c '^provision' "$owner_events") == 1 ]]
+  [[ ! -e $owner_lock && ! -L $owner_lock ]]
+
+  PATH="$fake_bin:$PATH" \
+    HOME="$term_home" \
+    XDG_STATE_HOME="$term_state" \
+    DOTFILES_TEST_EVENTS="$term_events" \
+    DOTFILES_TEST_REAL_MKDIR="$real_mkdir" \
+    DOTFILES_TEST_MARKER="$term_marker" \
+    DOTFILES_TEST_RELEASE="$term_release" \
+    "$repo_root/scripts/setup-nvim" >"$term_log" 2>&1 &
+  term_pid=$!
+  wait_for_setup_marker "$term_marker" "$term_pid"
+  term_child_pid=$(<"$term_marker")
+  [[ $term_child_pid =~ ^[0-9]+$ ]]
+  kill -0 "$term_child_pid"
+  [[ -d $term_lock && -f $term_lock/pid ]]
+  [[ $(<"$term_lock/pid") == "$term_pid" ]]
+
+  kill -TERM "$term_pid"
+  if wait "$term_pid"; then
+    term_status=0
+  else
+    term_status=$?
+  fi
+  term_pid=
+
+  [[ $term_status == 143 ]]
+  grep -Fqx $'child-term\t'"$term_child_pid" "$term_events"
+  if kill -0 "$term_child_pid" 2>/dev/null; then
+    return 1
+  fi
+  [[ ! -e $term_lock && ! -L $term_lock ]]
+  if grep -Fq $'provision\t' "$term_events" ||
+    grep -Fq 'Provisioning the reviewed plugin and toolchain graph' "$term_log"; then
+    return 1
+  fi
+)
+
+check_nvim_preflight_integrity() (
+  set -euo pipefail
+
+  local preflight_parent
+  local preflight_root
+  local baseline
+  local base_commit
+  local config_root
+  local lazy_root
+  local hook
+  local marker
+  local preflight_log
+  local replacement_commit
+  local case_name
+  local -a quarantined_cases
+
+  preflight_parent=${TMPDIR:-/tmp}
+  preflight_parent=$(cd -P -- "$preflight_parent" && pwd -P)
+  preflight_root=$(mktemp -d "$preflight_parent/dotfiles-nvim-preflight.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$preflight_root" "$preflight_parent" dotfiles-nvim-preflight.' EXIT HUP INT TERM
+
+  baseline="$preflight_root/baseline"
+  config_root="$preflight_root/config/nvim"
+  lazy_root="$preflight_root/data/nvim/lazy"
+  hook="$preflight_root/untrusted-filter"
+  marker="$preflight_root/untrusted-command-executed"
+  preflight_log="$preflight_root/preflight.log"
+  quarantined_cases=(
+    filter-metadata
+    gitlink
+    ignored-code
+    info-exclude
+    replace-ref
+    skip-index
+    stat-config
+    worktree-config
+  )
+
+  mkdir -p -- "$baseline" "$config_root" "$lazy_root" "$preflight_root/home"
+  git -C "$baseline" init --quiet
+  printf 'return { trusted = true }\n' >"$baseline/plugin.lua"
+  printf 'build/\n' >"$baseline/.gitignore"
+  git -C "$baseline" add -- plugin.lua .gitignore
+  git -C "$baseline" \
+    -c user.name='dotfiles canary' \
+    -c user.email='dotfiles-canary@example.invalid' \
+    commit --quiet -m baseline
+  base_commit=$(git -C "$baseline" rev-parse HEAD)
+
+  cp -R -- "$baseline" "$lazy_root/control"
+  for case_name in "${quarantined_cases[@]}"; do
+    cp -R -- "$baseline" "$lazy_root/$case_name"
+  done
+
+  mkdir -p -- "$preflight_root/external-worktree"
+  cp -- "$baseline/plugin.lua" "$preflight_root/external-worktree/plugin.lua"
+  cp -- "$baseline/.gitignore" "$preflight_root/external-worktree/.gitignore"
+  git -C "$lazy_root/worktree-config" config core.worktree "$preflight_root/external-worktree"
+
+  # The literal variable is expanded only if an unsafe Git metadata command
+  # executes. A safe preflight must quarantine this checkout first.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    ': >"$DOTFILES_NVIM_PREFLIGHT_MARKER"' \
+    'cat' \
+    >"$hook"
+  chmod 700 "$hook"
+  git -C "$lazy_root/filter-metadata" config filter.dotfiles-canary.clean "$hook"
+  printf '*.lua filter=dotfiles-canary\n' \
+    >"$lazy_root/filter-metadata/.git/info/attributes"
+  printf 'return { trusted = false }\n' >"$lazy_root/filter-metadata/plugin.lua"
+
+  printf 'hidden.lua\n' >>"$lazy_root/info-exclude/.git/info/exclude"
+  printf 'return { hidden = true }\n' >"$lazy_root/info-exclude/hidden.lua"
+
+  replacement_commit=$(
+    printf 'replacement metadata\n' |
+      git -C "$lazy_root/replace-ref" \
+        -c user.name='dotfiles canary' \
+        -c user.email='dotfiles-canary@example.invalid' \
+        commit-tree "${base_commit}^{tree}" -p "$base_commit"
+  )
+  git -C "$lazy_root/replace-ref" replace "$base_commit" "$replacement_commit"
+
+  printf 'return { trusted = false }\n' >"$lazy_root/skip-index/plugin.lua"
+  git -C "$lazy_root/skip-index" update-index --skip-worktree plugin.lua
+
+  git -C "$lazy_root/stat-config" config core.trustctime false
+  git -C "$lazy_root/stat-config" config core.checkStat minimal
+
+  mkdir -p -- "$lazy_root/ignored-code/build"
+  printf 'return { ignored = true }\n' >"$lazy_root/ignored-code/build/plugin.lua"
+
+  git -C "$lazy_root/gitlink" update-index \
+    --add --cacheinfo "160000,$base_commit,nested"
+  git -C "$lazy_root/gitlink" \
+    -c user.name='dotfiles canary' \
+    -c user.email='dotfiles-canary@example.invalid' \
+    commit --quiet -m gitlink
+
+  DOTFILES_NVIM_PREFLIGHT_LAZY_ROOT="$lazy_root" \
+    DOTFILES_NVIM_PREFLIGHT_CONFIG="$config_root/lazy-lock.json" \
+    python3 - <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+
+root = pathlib.Path(os.environ["DOTFILES_NVIM_PREFLIGHT_LAZY_ROOT"])
+lock = {}
+for checkout in sorted(path for path in root.iterdir() if path.is_dir()):
+    commit = subprocess.check_output(
+        ["git", "--no-replace-objects", "-C", str(checkout), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    lock[checkout.name] = {"branch": "main", "commit": commit}
+pathlib.Path(os.environ["DOTFILES_NVIM_PREFLIGHT_CONFIG"]).write_text(
+    json.dumps(lock, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
+  env \
+    DOTFILES_NVIM_PREFLIGHT_MARKER="$marker" \
+    DOTFILES_NVIM_PREFLIGHT_SCRIPT="$repo_root/scripts/nvim-preflight.lua" \
+    HOME="$preflight_root/home" \
+    NVIM_APPNAME=nvim \
+    XDG_CONFIG_HOME="$preflight_root/config" \
+    XDG_DATA_HOME="$preflight_root/data" \
+    XDG_STATE_HOME="$preflight_root/state" \
+    nvim --clean --headless -u NONE \
+      '+lua dofile(vim.env.DOTFILES_NVIM_PREFLIGHT_SCRIPT)' +qa \
+      >"$preflight_log" 2>&1
+
+  [[ -d $lazy_root/control ]]
+  [[ ! -e $marker && ! -L $marker ]]
+  for case_name in "${quarantined_cases[@]}"; do
+    [[ ! -e $lazy_root/$case_name && ! -L $lazy_root/$case_name ]]
+    [[ -n $(find "$preflight_root/data/nvim/dotfiles-quarantine" \
+      -mindepth 2 -maxdepth 2 -type d -name "$case_name" -print -quit) ]]
+    grep -Fq "Quarantined Neovim plugin $case_name:" "$preflight_log"
+  done
+)
+
+check_nvim_bootstrap() (
+  set -euo pipefail
+
+  local bootstrap_parent
+  local bootstrap_root
+  local expected_commit
+  local expected_lazyvim_commit
+  local installed_commit
+  local lazy_path
+  local lazyvim_path
+  local lock_probe
+  local nvim_log
+
+  bootstrap_parent=${TMPDIR:-/tmp}
+  bootstrap_parent=$(cd -P -- "$bootstrap_parent" && pwd -P)
+  bootstrap_root=$(mktemp -d "$bootstrap_parent/dotfiles-nvim-bootstrap.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$bootstrap_root" "$bootstrap_parent" dotfiles-nvim-bootstrap.' EXIT HUP INT TERM
+
+  lazy_path="$bootstrap_root/data/nvim/lazy/lazy.nvim"
+  lazyvim_path="$bootstrap_root/data/nvim/lazy/LazyVim"
+  lock_probe="$bootstrap_root/lazy-lock.json"
+  nvim_log="$bootstrap_root/nvim.log"
+  expected_commit=$(jq -er '."lazy.nvim".commit' home/dot_config/nvim/lazy-lock.json)
+  expected_lazyvim_commit=$(jq -er '.LazyVim.commit' home/dot_config/nvim/lazy-lock.json)
+  printf '{}\n' >"$lock_probe"
+
+  # Exercise the repository's real bootstrap without resolving the full plugin
+  # graph. The second process then makes lazy.nvim write a minimal lock so a
+  # missing origin/HEAD cannot silently truncate the deployed lock on day one.
+  env \
+    DOTFILES_REPO_ROOT="$repo_root" \
+    NVIM_APPNAME=nvim \
+    XDG_CACHE_HOME="$bootstrap_root/cache" \
+    XDG_CONFIG_HOME="$bootstrap_root/config" \
+    XDG_DATA_HOME="$bootstrap_root/data" \
+    XDG_STATE_HOME="$bootstrap_root/state" \
+    nvim --clean --headless -u NONE \
+      --cmd 'lua package.preload["lazy"] = function() return { setup = function() end } end' \
+      --cmd 'lua local ok, err = pcall(dofile, vim.env.DOTFILES_REPO_ROOT .. "/" .. "home/dot_config/nvim/lua/config/lazy.lua"); if not ok then vim.api.nvim_err_writeln(err); vim.cmd("cquit 1") end' \
+      +qa >"$nvim_log" 2>&1
+
+  installed_commit=$(git -C "$lazy_path" rev-parse HEAD)
+  [[ $installed_commit == "$expected_commit" ]]
+  [[ $(git -C "$lazy_path" symbolic-ref refs/remotes/origin/HEAD) == refs/remotes/origin/main ]]
+  [[ $(git -C "$lazy_path" rev-parse refs/remotes/origin/main) == "$expected_commit" ]]
+  [[ $(git -C "$lazyvim_path" rev-parse HEAD) == "$expected_lazyvim_commit" ]]
+  [[ $(git -C "$lazyvim_path" symbolic-ref refs/remotes/origin/HEAD) == refs/remotes/origin/main ]]
+  [[ $(git -C "$lazyvim_path" rev-parse refs/remotes/origin/main) == "$expected_lazyvim_commit" ]]
+
+  env \
+    DOTFILES_LAZY_PATH="$lazy_path" \
+    DOTFILES_LOCK_PROBE="$lock_probe" \
+    NVIM_APPNAME=nvim \
+    nvim --clean --headless -u NONE \
+      --cmd 'lua vim.opt.rtp:prepend(vim.env.DOTFILES_LAZY_PATH)' \
+      --cmd 'lua local ok, err = pcall(function() require("lazy").setup({ spec = {{ "folke/lazy.nvim" }}, root = vim.fn.fnamemodify(vim.env.DOTFILES_LAZY_PATH, ":h"), lockfile = vim.env.DOTFILES_LOCK_PROBE, install = { missing = false }, checker = { enabled = false }, change_detection = { enabled = false } }); require("lazy.manage.lock").update() end); if not ok then vim.api.nvim_err_writeln(err); vim.cmd("cquit 1") end' \
+      +qa >>"$nvim_log" 2>&1
+
+  jq -e \
+    --arg commit "$expected_commit" \
+    'keys == ["lazy.nvim"] and ."lazy.nvim" == {"branch":"main", "commit":$commit}' \
+    "$lock_probe" >/dev/null
+  ! grep -Eq 'E[0-9]{3,}|assertion failed|bootstrap failed' "$nvim_log"
+)
+
+check_nvim_first_start() (
+  set -euo pipefail
+
+  local canary_parent
+  local canary_root
+  local drift_marker
+  local fsmonitor_hook
+  local git_template
+  local global_attributes
+  local lazy_root
+  local lazyvim_init
+  local lualine_init
+  local nvim_log
+  local nvim_error_pattern
+  local post_checkout_hook
+  local quarantine_root
+  local theme_init
+
+  canary_parent=${TMPDIR:-/tmp}
+  canary_parent=$(cd -P -- "$canary_parent" && pwd -P)
+  canary_root=$(mktemp -d "$canary_parent/dotfiles-nvim-first-start.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$canary_root" "$canary_parent" dotfiles-nvim-first-start.' EXIT HUP INT TERM
+
+  mkdir -p -- "$canary_root/config" "$canary_root/home" "$canary_root/state"
+  cp -R -- home/dot_config/nvim "$canary_root/config/nvim"
+  nvim_log="$canary_root/nvim.log"
+  lazy_root="$canary_root/data/nvim/lazy"
+  quarantine_root="$canary_root/data/nvim/dotfiles-quarantine"
+  drift_marker="$canary_root/old-plugin-code-executed"
+  fsmonitor_hook="$canary_root/untrusted-fsmonitor"
+  git_template="$canary_root/untrusted-git-template"
+  global_attributes="$canary_root/untrusted-global-attributes"
+  post_checkout_hook="$lazy_root/plenary.nvim/.git/hooks/post-checkout"
+  nvim_error_pattern='Package is already installing|Failed to run .(init|config).|installation was aborted|Neovim is exiting while packages are still installing|Terminating all installations|lazy task failed|Mason package .* did not converge|E[0-9]{3,}|bootstrap failed|timed out waiting'
+
+  # A cold clone must not execute content-changing or executable inputs from
+  # the caller's personal Git configuration. If setup-nvim fails to install
+  # its controlled Git view, this hook/filter both leaves an observable marker
+  # and corrupts checked-out Lua, making the canary fail closed.
+  mkdir -p -- "$git_template/hooks"
+  # The canary expands this variable only when Git invokes it.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    ': >"$DOTFILES_NVIM_DRIFT_MARKER"' \
+    "printf 'canary-token\\n'" \
+    >"$fsmonitor_hook"
+  chmod 700 "$fsmonitor_hook"
+  cp -- "$fsmonitor_hook" "$git_template/hooks/post-checkout"
+  chmod 700 "$git_template/hooks/post-checkout"
+  printf '*.lua filter=dotfiles-canary\n' >"$global_attributes"
+  git config --file "$canary_root/home/.gitconfig" core.hooksPath "$git_template/hooks"
+  git config --file "$canary_root/home/.gitconfig" init.templateDir "$git_template"
+  git config --file "$canary_root/home/.gitconfig" core.attributesFile "$global_attributes"
+  git config --file "$canary_root/home/.gitconfig" filter.dotfiles-canary.clean "$fsmonitor_hook"
+  git config --file "$canary_root/home/.gitconfig" filter.dotfiles-canary.smudge "$fsmonitor_hook"
+
+  if ! env \
+    DOTFILES_NVIM_DRIFT_MARKER="$drift_marker" \
+    DOTFILES_NVIM_PREFLIGHT_SCRIPT=/definitely/missing-preflight.lua \
+    DOTFILES_NVIM_SETUP_SCRIPT=/definitely/missing-setup.lua \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=core.fsmonitor \
+    GIT_CONFIG_VALUE_0=/definitely/missing-fsmonitor \
+    GIT_DIR=/definitely/missing-git-dir \
+    GIT_INDEX_FILE=/definitely/missing-git-index \
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_TEMPLATE_DIR=/definitely/missing-git-template \
+    GIT_WORK_TREE=/definitely/missing-git-worktree \
+    GOFLAGS=-modcacherw \
+    HOME="$canary_root/home" \
+    NVIM_APPNAME=caller-value-must-not-win \
+    XDG_CACHE_HOME="$canary_root/cache" \
+    XDG_CONFIG_HOME="$canary_root/config" \
+    XDG_DATA_HOME="$canary_root/data" \
+    XDG_STATE_HOME="$canary_root/state" \
+    "$repo_root/scripts/setup-nvim" \
+      >"$nvim_log" 2>&1; then
+    tail -n 200 "$nvim_log" >&2
+    return 1
+  fi
+
+  if [[ -e $drift_marker || -L $drift_marker ]]; then
+    printf 'personal Git configuration executed during a cold Neovim clone\n' >&2
+    return 1
+  fi
+
+  if grep -Eq "$nvim_error_pattern" "$nvim_log"; then
+    grep -En "$nvim_error_pattern" "$nvim_log" >&2
+    return 1
+  fi
+
+  cmp -- \
+    home/dot_config/nvim/lazy-lock.json \
+    "$canary_root/config/nvim/lazy-lock.json" || return 1
+
+  # Exercise both drift classes before a real config can load them: a clean
+  # manager commit mismatch, a clean LazyVim commit containing an observable
+  # startup side effect, and a dirty start-plugin checkout with the same side
+  # effect. The clean preflight must quarantine all three, preserve them, and
+  # let the single normal process install exact locked checkouts.
+  git -C "$lazy_root/lazy.nvim" \
+    -c user.name='dotfiles canary' \
+    -c user.email='dotfiles-canary@example.invalid' \
+    commit --quiet --allow-empty -m 'canary manager drift' || return 1
+
+  lazyvim_init="$lazy_root/LazyVim/lua/lazyvim/config/init.lua"
+  printf '\nvim.fn.writefile({ "executed" }, vim.env.DOTFILES_NVIM_DRIFT_MARKER)\n' \
+    >>"$lazyvim_init"
+  git -C "$lazy_root/LazyVim" add -- lua/lazyvim/config/init.lua || return 1
+  git -C "$lazy_root/LazyVim" \
+    -c user.name='dotfiles canary' \
+    -c user.email='dotfiles-canary@example.invalid' \
+    commit --quiet -m 'canary LazyVim drift' || return 1
+
+  theme_init="$lazy_root/solarized-osaka.nvim/lua/solarized-osaka/init.lua"
+  printf '\nvim.fn.writefile({ "executed" }, vim.env.DOTFILES_NVIM_DRIFT_MARKER)\n' \
+    >>"$theme_init"
+  git -C "$lazy_root/solarized-osaka.nvim" \
+    update-index --skip-worktree lua/solarized-osaka/init.lua || return 1
+
+  lualine_init="$lazy_root/lualine.nvim/lua/lualine.lua"
+  printf '\nvim.fn.writefile({ "executed" }, vim.env.DOTFILES_NVIM_DRIFT_MARKER)\n' \
+    >>"$lualine_init"
+  # Git metadata is outside the worktree. Keep this checkout exact and clean,
+  # but give it two executable metadata channels. Preflight must quarantine
+  # unsupported metadata before either channel can execute.
+  git -C "$lazy_root/plenary.nvim" config core.fsmonitor "$fsmonitor_hook" || return 1
+  cp -- "$fsmonitor_hook" "$post_checkout_hook"
+  chmod 700 "$post_checkout_hook"
+
+  if ! env \
+    DOTFILES_NVIM_DRIFT_MARKER="$drift_marker" \
+    GIT_TERMINAL_PROMPT=0 \
+    GOFLAGS=-modcacherw \
+    HOME="$canary_root/home" \
+    NVIM_APPNAME=caller-value-must-not-win \
+    XDG_CACHE_HOME="$canary_root/cache" \
+    XDG_CONFIG_HOME="$canary_root/config" \
+    XDG_DATA_HOME="$canary_root/data" \
+    XDG_STATE_HOME="$canary_root/state" \
+    "$repo_root/scripts/setup-nvim" \
+      >>"$nvim_log" 2>&1; then
+    tail -n 200 "$nvim_log" >&2
+    return 1
+  fi
+  if grep -Eq "$nvim_error_pattern" "$nvim_log"; then
+    grep -En "$nvim_error_pattern" "$nvim_log" >&2
+    return 1
+  fi
+  if [[ -e $drift_marker || -L $drift_marker ]]; then
+    printf 'a drifted Neovim plugin executed before quarantine\n' >&2
+    return 1
+  fi
+  grep -Fq 'Quarantined Neovim plugin lazy.nvim:' "$nvim_log" || return 1
+  grep -Fq 'Quarantined Neovim plugin LazyVim:' "$nvim_log" || return 1
+  grep -Fq 'Quarantined Neovim plugin lualine.nvim:' "$nvim_log" || return 1
+  grep -Fq 'Quarantined Neovim plugin plenary.nvim:' "$nvim_log" || return 1
+  grep -Fq 'Quarantined Neovim plugin solarized-osaka.nvim:' "$nvim_log" || return 1
+  [[ -n $(find "$quarantine_root" -mindepth 2 -maxdepth 2 -type d -name lazy.nvim -print -quit) ]] || return 1
+  [[ -n $(find "$quarantine_root" -mindepth 2 -maxdepth 2 -type d -name LazyVim -print -quit) ]] || return 1
+  [[ -n $(find "$quarantine_root" -mindepth 2 -maxdepth 2 -type d -name lualine.nvim -print -quit) ]] || return 1
+  [[ -n $(find "$quarantine_root" -mindepth 2 -maxdepth 2 -type d -name plenary.nvim -print -quit) ]] || return 1
+  [[ -n $(find "$quarantine_root" -mindepth 2 -maxdepth 2 -type d -name solarized-osaka.nvim -print -quit) ]] || return 1
+  [[ ! -e $canary_root/state/nvim/dotfiles-setup.lock ]] || return 1
+
+  cmp -- \
+    home/dot_config/nvim/lazy-lock.json \
+    "$canary_root/config/nvim/lazy-lock.json" || return 1
+
+  DOTFILES_NVIM_CANARY_ROOT="$canary_root" python3 - <<'PY'
+import json
+import os
+import pathlib
+import platform
+import subprocess
+
+root = pathlib.Path(os.environ["DOTFILES_NVIM_CANARY_ROOT"])
+lock = json.loads(
+    pathlib.Path("home/dot_config/nvim/lazy-lock.json").read_text(encoding="utf-8")
+)
+plugins = root / "data" / "nvim" / "lazy"
+missing = []
+wrong = []
+gitlinks = []
+for name, entry in sorted(lock.items()):
+    path = plugins / name
+    if not path.is_dir():
+        missing.append(name)
+        continue
+    head = subprocess.check_output(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if head != entry["commit"]:
+        wrong.append((name, entry["commit"], head))
+    staged = subprocess.check_output(
+        ["git", "-C", str(path), "ls-files", "-s"], text=True
+    ).splitlines()
+    if any(line.startswith("160000 ") for line in staged):
+        gitlinks.append(name)
+
+if missing or wrong or gitlinks:
+    raise SystemExit(
+        f"missing plugins: {missing}; wrong plugin commits: {wrong}; "
+        f"unverified gitlinks: {gitlinks}"
+    )
+
+mason_packages = root / "data" / "nvim" / "mason" / "packages"
+package_dirs = sorted(path for path in mason_packages.iterdir() if path.is_dir())
+without_receipts = [path.name for path in package_dirs if not (path / "mason-receipt.json").is_file()]
+linux_arm64 = platform.system() == "Linux" and platform.machine() in {"aarch64", "arm64"}
+expected_packages = 16 if linux_arm64 else 18
+if len(package_dirs) != expected_packages or without_receipts:
+    raise SystemExit(
+        f"expected {expected_packages} complete Mason packages; found {len(package_dirs)}; "
+        f"missing receipts: {without_receipts}"
+    )
+PY
+)
+
+check_json() {
+  jq empty \
+    home/dot_config/nvim/lazy-lock.json \
+    home/dot_config/nvim/lazyvim.json
+}
+
+check_nvim_lock() {
+  python3 - <<'PY'
+import json
+import pathlib
+import re
+
+lock_path = pathlib.Path("home/dot_config/nvim/lazy-lock.json")
+lock = json.loads(lock_path.read_text(encoding="utf-8"))
+if not isinstance(lock, dict) or len(lock) != 50:
+    raise SystemExit(f"expected exactly 50 locked Neovim plugins, found {len(lock)}")
+
+for name, entry in sorted(lock.items()):
+    if not isinstance(entry, dict):
+        raise SystemExit(f"invalid lock entry for {name}")
+    branch = entry.get("branch")
+    commit = entry.get("commit")
+    if not isinstance(branch, str) or not branch:
+        raise SystemExit(f"missing locked branch for {name}")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SystemExit(f"invalid locked commit for {name}: {commit}")
+
+if lock["nvim-treesitter"]["branch"] != "main":
+    raise SystemExit("the Neovim 0.12 configuration expects nvim-treesitter main")
+lazy_bootstrap = pathlib.Path(
+    "home/dot_config/nvim/lua/config/lazy.lua"
+).read_text(encoding="utf-8")
+match = re.search(r'^local lazy_commit = "([0-9a-f]{40})"$', lazy_bootstrap, re.MULTILINE)
+if not match or match.group(1) != lock["lazy.nvim"]["commit"]:
+    raise SystemExit("lazy.nvim bootstrap commit does not match lazy-lock.json")
+lazyvim_match = re.search(r'^local lazyvim_commit = "([0-9a-f]{40})"$', lazy_bootstrap, re.MULTILINE)
+if not lazyvim_match or lazyvim_match.group(1) != lock["LazyVim"]["commit"]:
+    raise SystemExit("LazyVim bootstrap commit does not match lazy-lock.json")
+if "local benchmark = vim.g.dotfiles_benchmark == 1" not in lazy_bootstrap:
+    raise SystemExit("Neovim benchmark mode is not declared before lazy setup")
+if "install = { missing = not benchmark }" not in lazy_bootstrap:
+    raise SystemExit("Neovim benchmark mode no longer disables missing-plugin installation")
+if "aerial.nvim" not in lock:
+    raise SystemExit("aerial.nvim is configured but missing from the lock")
+if "render-markdown.nvim" not in lock:
+    raise SystemExit("render-markdown.nvim is configured but missing from the lock")
+mason_spec = pathlib.Path(
+    "home/dot_config/nvim/lua/plugins/lsp.lua"
+).read_text(encoding="utf-8")
+if "github:mason-org/mason-registry@2026-08-10-faulty-close" not in mason_spec:
+    raise SystemExit("the Mason registry release is not pinned")
+treesitter_spec = pathlib.Path(
+    "home/dot_config/nvim/lua/plugins/treesitter.lua"
+).read_text(encoding="utf-8")
+for label, spec in (("Mason", mason_spec), ("Treesitter", treesitter_spec)):
+    if "vim.g.dotfiles_benchmark == 1" not in spec or "opts.ensure_installed = {}" not in spec:
+        raise SystemExit(f"Neovim benchmark mode no longer disables {label} provisioning")
+for stale in (
+    "image.nvim",
+    "markdown-preview.nvim",
+    "nvim-treesitter-playground",
+    "symbols-outline.nvim",
+):
+    if stale in lock:
+        raise SystemExit(f"stale Neovim lock entry: {stale}")
+PY
+}
+
+check_toml() {
+  python3 -c \
+    'import pathlib, sys, tomllib; [tomllib.loads(pathlib.Path(name).read_text()) for name in sys.argv[1:]]' \
+    home/dot_config/alacritty/alacritty.toml \
+    theme/solarized-osaka.toml \
+    third_party/nvm.fish/UPSTREAM.toml \
+    third_party/hsl-color/UPSTREAM.toml \
+    third_party/ranger-scope/UPSTREAM.toml
+}
+
+check_theme() {
+  python3 - <<'PY'
+import hashlib
+import json
+import math
+import pathlib
+import re
+import tomllib
+
+manifest = tomllib.loads(
+    pathlib.Path("theme/solarized-osaka.toml").read_text(encoding="utf-8")
+)
+lock = json.loads(
+    pathlib.Path("home/dot_config/nvim/lazy-lock.json").read_text(encoding="utf-8")
+)
+if manifest["revision"] != lock["solarized-osaka.nvim"]["commit"]:
+    raise SystemExit("theme manifest revision does not match the Neovim lock")
+required_provenance = {
+    "name",
+    "source",
+    "revision",
+    "license",
+    "license_path",
+    "license_sha256",
+}
+missing_provenance = required_provenance - manifest.keys()
+if missing_provenance:
+    raise SystemExit(f"theme manifest is missing provenance fields: {sorted(missing_provenance)}")
+if manifest["license"] != "Apache-2.0":
+    raise SystemExit("Solarized Osaka must retain its Apache-2.0 license")
+if manifest["source"] != "https://github.com/craftzdog/solarized-osaka.nvim":
+    raise SystemExit("theme manifest source does not match the configured plugin")
+theme_spec = pathlib.Path(
+    "home/dot_config/nvim/lua/plugins/colorscheme.lua"
+).read_text(encoding="utf-8")
+if '"craftzdog/solarized-osaka.nvim"' not in theme_spec:
+    raise SystemExit("configured Neovim theme no longer matches the manifest source")
+if manifest["license_path"] != "third_party/solarized-osaka/LICENSE":
+    raise SystemExit("theme license path must remain a repository-relative vendor path")
+license_path = pathlib.Path(manifest["license_path"])
+if not license_path.is_file():
+    raise SystemExit(f"theme license is missing: {license_path}")
+license_sha256 = hashlib.sha256(license_path.read_bytes()).hexdigest()
+if license_sha256 != manifest["license_sha256"]:
+    raise SystemExit(
+        f"theme license checksum mismatch: expected {manifest['license_sha256']}, "
+        f"found {license_sha256}"
+    )
+
+primary = manifest["primary"]
+ansi = manifest["ansi"]
+ui = manifest["ui"]
+for section in (primary, ansi, ui):
+    for name, value in section.items():
+        if name == "opacity":
+            continue
+        if not re.fullmatch(r"#[0-9a-f]{6}", value):
+            raise SystemExit(f"invalid normalized theme color: {name}={value}")
+
+alacritty = tomllib.loads(
+    pathlib.Path("home/dot_config/alacritty/alacritty.toml").read_text(encoding="utf-8")
+)
+if alacritty["colors"]["primary"] != {
+    "background": primary["background"],
+    "foreground": primary["foreground"],
+}:
+    raise SystemExit("Alacritty primary colors drifted from the manifest")
+if alacritty["colors"]["normal"] != ansi or alacritty["colors"]["bright"] != ansi:
+    raise SystemExit("Alacritty ANSI colors drifted from the manifest")
+if alacritty["window"]["opacity"] != primary["opacity"]:
+    raise SystemExit("Alacritty opacity drifted from the manifest")
+if alacritty["colors"]["transparent_background_colors"] is not False:
+    raise SystemExit("Alacritty must blend only its primary background")
+
+revision = manifest["revision"]
+paths = (
+    pathlib.Path("home/dot_config/alacritty/alacritty.toml"),
+    pathlib.Path("home/dot_config/tmux/theme.conf"),
+    pathlib.Path("home/dot_config/fish/functions/fish_prompt.fish"),
+    pathlib.Path("home/dot_config/i3/config"),
+)
+texts = {path: path.read_text(encoding="utf-8") for path in paths}
+for path, text in texts.items():
+    if revision not in text:
+        raise SystemExit(f"{path} does not identify the palette revision")
+
+fish_expected = {name: value.removeprefix("#") for name, value in ansi.items()}
+fish_actual = dict(
+    re.findall(
+        r"^\s*set -l osaka_([a-z0-9]+) ([0-9a-f]{6})$",
+        texts[pathlib.Path("home/dot_config/fish/functions/fish_prompt.fish")],
+        re.MULTILINE,
+    )
+)
+for name in ("red", "green", "yellow", "blue", "magenta", "cyan"):
+    if fish_actual.get(name) != fish_expected[name]:
+        raise SystemExit(f"Fish prompt color drifted: {name}")
+
+i3_expected = {
+    "bg": primary["background"],
+    "surface": ui["surface"],
+    "base02": ui["base02"],
+    "base01": ui["base01"],
+    "fg": primary["foreground"],
+    "base0": ui["base0"],
+    "white": ui["white"],
+    "yellow": ansi["yellow"],
+    "red": ansi["red"],
+    "blue": ansi["blue"],
+    "cyan": ansi["cyan"],
+}
+i3_actual = dict(
+    re.findall(
+        r"^set \$osaka_([a-z0-9]+) (#[0-9a-f]{6})$",
+        texts[pathlib.Path("home/dot_config/i3/config")],
+        re.MULTILINE,
+    )
+)
+if i3_actual != i3_expected:
+    raise SystemExit("i3 palette variables drifted from the manifest")
+
+tmux_text = texts[pathlib.Path("home/dot_config/tmux/theme.conf")]
+allowed_tmux_colors = {
+    primary["background"],
+    primary["foreground"],
+    *ansi.values(),
+    *ui.values(),
+}
+unknown_tmux_colors = set(re.findall(r"#[0-9a-f]{6}\b", tmux_text)) - allowed_tmux_colors
+if unknown_tmux_colors:
+    raise SystemExit(f"tmux contains colors outside the manifest: {unknown_tmux_colors}")
+tmux_values = {}
+for line in tmux_text.splitlines():
+    match = re.match(r"^set-(?:window-)?option -g ([^ ]+) '([^']*)'$", line)
+    if match:
+        tmux_values[match.group(1)] = match.group(2)
+expected_tmux_values = {
+    "mode-style": f"fg={primary['background']},bg={ansi['cyan']},bold",
+    "message-style": f"fg={ui['base2']},bg={ui['surface']}",
+    "message-command-style": f"fg={primary['background']},bg={ansi['yellow']},bold",
+    "pane-border-style": f"fg={ui['surface']},bg=default",
+    "pane-active-border-style": f"fg={ansi['blue']},bg=default",
+    "window-status-style": f"fg={primary['foreground']},bg={primary['background']}",
+    "window-status-current-style": f"fg={primary['background']},bg={ansi['blue']},bold",
+    "window-status-activity-style": f"fg={ansi['cyan']},bg={primary['background']},underscore",
+    "window-status-bell-style": f"fg={ui['white']},bg={ansi['red']},bold",
+}
+for option, expected in expected_tmux_values.items():
+    if tmux_values.get(option) != expected:
+        raise SystemExit(f"tmux {option} drifted from the manifest")
+active_red_lines = [
+    line for line in tmux_text.splitlines()
+    if ansi["red"] in line and not line.lstrip().startswith("#")
+]
+if len(active_red_lines) != 1 or "window-status-bell-style" not in active_red_lines[0]:
+    raise SystemExit("tmux must reserve red for its bell state")
+
+def relative_luminance(color):
+    channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    channels = [
+        value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+        for value in channels
+    ]
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+def contrast(left, right):
+    high, low = sorted((relative_luminance(left), relative_luminance(right)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+pairs = {
+    "terminal foreground": (primary["foreground"], primary["background"]),
+    "tmux message": (ui["base2"], ui["surface"]),
+    "yellow accent": (ansi["yellow"], primary["background"]),
+    "blue accent": (ansi["blue"], primary["background"]),
+    "cyan accent": (ansi["cyan"], primary["background"]),
+    "inactive text": (ui["base0"], ui["surface"]),
+    "urgent text": (ui["white"], ansi["red"]),
+}
+for label, colors in pairs.items():
+    ratio = contrast(*colors)
+    if not math.isfinite(ratio) or ratio < 4.5:
+        raise SystemExit(f"theme contrast below 4.5:1 for {label}: {ratio:.2f}")
+PY
+}
+
+check_nvm_vendor() {
+  python3 - <<'PY'
+import hashlib
+import pathlib
+import tomllib
+
+metadata_path = pathlib.Path("third_party/nvm.fish/UPSTREAM.toml")
+metadata = tomllib.loads(metadata_path.read_text(encoding="utf-8"))
+required = (
+    "name",
+    "version",
+    "source",
+    "revision",
+    "license",
+    "license_path",
+    "license_sha256",
+)
+for key in required:
+    if not isinstance(metadata.get(key), str) or not metadata[key]:
+        raise SystemExit(f"nvm.fish metadata is missing {key}")
+if len(metadata["revision"]) != 40 or len(metadata["license_sha256"]) != 64:
+    raise SystemExit("nvm.fish revision or license SHA-256 has an invalid length")
+files = metadata.get("files")
+if not isinstance(files, dict) or len(files) != 7:
+    raise SystemExit("UPSTREAM.toml must describe exactly 7 nvm.fish files")
+
+for relative, expected in sorted(files.items()):
+    relative_path = pathlib.Path(relative)
+    if (
+        relative_path.is_absolute()
+        or ".." in relative_path.parts
+        or relative_path.parts[:3] != ("home", "dot_config", "fish")
+    ):
+        raise SystemExit(f"unsafe nvm.fish metadata path: {relative}")
+
+    source_path = relative_path
+    if not source_path.is_file():
+        raise SystemExit(f"missing vendored nvm.fish file: {source_path}")
+    actual = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"nvm.fish checksum mismatch for {source_path}: "
+            f"expected {expected}, got {actual}"
+        )
+
+license_path = pathlib.Path(metadata["license_path"])
+if license_path.is_absolute() or ".." in license_path.parts or not license_path.is_file():
+    raise SystemExit(f"missing or unsafe nvm.fish license path: {license_path}")
+actual_license = hashlib.sha256(license_path.read_bytes()).hexdigest()
+if actual_license != metadata["license_sha256"]:
+    raise SystemExit(
+        f"nvm.fish license checksum mismatch: expected {metadata['license_sha256']}, "
+        f"got {actual_license}"
+    )
+PY
+}
+
+check_ranger_vendor() {
+  python3 - <<'PY'
+import hashlib
+import pathlib
+import tomllib
+
+metadata_path = pathlib.Path("third_party/ranger-scope/UPSTREAM.toml")
+metadata = tomllib.loads(metadata_path.read_text(encoding="utf-8"))
+deployed = metadata.get("deployed", {})
+required = (
+    "name",
+    "version",
+    "source",
+    "revision",
+    "upstream_path",
+    "upstream_sha256",
+    "license",
+    "license_path",
+    "license_sha256",
+)
+for key in required:
+    if not isinstance(metadata.get(key), str) or not metadata[key]:
+        raise SystemExit(f"ranger scope metadata is missing {key}")
+if len(metadata["revision"]) != 40 or len(metadata["upstream_sha256"]) != 64:
+    raise SystemExit("ranger scope revision or upstream SHA-256 has an invalid length")
+modifications = metadata.get("modifications")
+if not isinstance(modifications, list) or not modifications or not all(
+    isinstance(item, str) and item for item in modifications
+):
+    raise SystemExit("ranger scope modifications must be a non-empty string list")
+checks = {
+    deployed.get("path"): deployed.get("sha256"),
+    metadata.get("license_path"): metadata.get("license_sha256"),
+}
+
+for relative, expected in checks.items():
+    if not isinstance(relative, str) or not isinstance(expected, str):
+        raise SystemExit("ranger scope metadata is missing a path or SHA-256")
+    relative_path = pathlib.Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise SystemExit(f"unsafe ranger scope metadata path: {relative}")
+    if not relative_path.is_file():
+        raise SystemExit(f"missing ranger scope provenance file: {relative_path}")
+    actual = hashlib.sha256(relative_path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"ranger scope checksum mismatch for {relative_path}: "
+            f"expected {expected}, got {actual}"
+        )
+PY
+}
+
+check_hsl_vendor() {
+  python3 - <<'PY'
+import hashlib
+import pathlib
+import tomllib
+
+metadata_path = pathlib.Path("third_party/hsl-color/UPSTREAM.toml")
+metadata = tomllib.loads(metadata_path.read_text(encoding="utf-8"))
+deployed = metadata.get("deployed", {})
+required = (
+    "name",
+    "source",
+    "revision",
+    "upstream_path",
+    "upstream_sha256",
+    "license",
+    "license_path",
+    "license_sha256",
+    "attribution",
+)
+for key in required:
+    if not isinstance(metadata.get(key), str) or not metadata[key]:
+        raise SystemExit(f"HSL metadata is missing {key}")
+if len(metadata["revision"]) != 40 or len(metadata["upstream_sha256"]) != 64:
+    raise SystemExit("HSL revision or upstream SHA-256 has an invalid length")
+modifications = metadata.get("modifications")
+if not isinstance(modifications, list) or not modifications or not all(
+    isinstance(item, str) and item for item in modifications
+):
+    raise SystemExit("HSL modifications must be a non-empty string list")
+checks = {
+    deployed.get("path"): deployed.get("sha256"),
+    metadata.get("license_path"): metadata.get("license_sha256"),
+}
+
+for relative, expected in checks.items():
+    if not isinstance(relative, str) or not isinstance(expected, str):
+        raise SystemExit("HSL metadata is missing a path or SHA-256")
+    relative_path = pathlib.Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise SystemExit(f"unsafe HSL metadata path: {relative}")
+    if not relative_path.is_file():
+        raise SystemExit(f"missing HSL provenance file: {relative_path}")
+    actual = hashlib.sha256(relative_path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"HSL checksum mismatch for {relative_path}: "
+            f"expected {expected}, got {actual}"
+        )
+PY
+}
+
+check_shell() {
+  local file
+  local -a bash_files=(
+    scripts/check
+    scripts/benchmark
+    scripts/bootstrap
+    scripts/install-chezmoi
+    scripts/setup-nvim
+    scripts/backup
+    scripts/restore
+    scripts/lib/safety.bash
+    home/dot_config/ranger/executable_scope.sh
+  )
+  local -a sh_files=(
+    home/executable_dot_xinitrc
+    home/dot_xprofile
+  )
+
+  for file in "${bash_files[@]}"; do
+    bash -n "$file" || return 1
+  done
+  for file in "${sh_files[@]}"; do
+    sh -n "$file" || return 1
+  done
+}
+
+check_shellcheck() {
+  shellcheck \
+    scripts/check \
+    scripts/benchmark \
+    scripts/bootstrap \
+    scripts/install-chezmoi \
+    scripts/setup-nvim \
+    scripts/backup \
+    scripts/restore \
+    scripts/lib/safety.bash \
+    home/executable_dot_xinitrc \
+    home/dot_xprofile
+}
+
+check_tmux() (
+  set -euo pipefail
+
+  local socket="dotfiles-check-$$"
+  local conf
+  local first_snapshot
+  local second_snapshot
+  local terminal
+
+  tmux -L "$socket" -f /dev/null new-session -d -s dotfiles-check
+  trap 'tmux -L "$socket" kill-server >/dev/null 2>&1 || true' EXIT HUP INT TERM
+  for conf in home/dot_config/tmux/*.conf; do
+    tmux -L "$socket" source-file -n "$conf" >/dev/null
+  done
+
+  tmux -L "$socket" source-file "$repo_root/home/dot_config/tmux/tmux.conf"
+  [[ $(tmux -L "$socket" show-options -gv prefix) == C-t ]]
+  terminal=$(tmux -L "$socket" show-options -gv default-terminal)
+  [[ $terminal == tmux-256color || $terminal == screen-256color ]]
+  [[ $(tmux -L "$socket" show-options -gv @dotfiles_config_file) == "$repo_root/home/dot_config/tmux/tmux.conf" ]]
+  tmux -L "$socket" list-keys -T prefix | grep -F 'lazygit is not installed' >/dev/null
+
+  first_snapshot=$(
+    tmux -L "$socket" show-options -sv terminal-features
+    tmux -L "$socket" show-options -sv terminal-overrides
+    tmux -L "$socket" show-options -gv status-left
+  )
+  tmux -L "$socket" source-file "$repo_root/home/dot_config/tmux/tmux.conf"
+  second_snapshot=$(
+    tmux -L "$socket" show-options -sv terminal-features
+    tmux -L "$socket" show-options -sv terminal-overrides
+    tmux -L "$socket" show-options -gv status-left
+  )
+  [[ $first_snapshot == "$second_snapshot" ]]
+)
+
+check_i3() {
+  i3 -C -c "$repo_root/home/dot_config/i3/config" >/dev/null
+}
+
+check_ranger_scope() (
+  set -uo pipefail
+
+  local scope_parent
+  local scope_root
+  local scope_input
+  local scope_stderr
+  local scope_status
+
+  scope_parent=${TMPDIR:-/tmp}
+  scope_parent=$(cd -P -- "$scope_parent" && pwd -P)
+  scope_root=$(mktemp -d "$scope_parent/dotfiles-scope.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$scope_root" "$scope_parent" dotfiles-scope.' EXIT HUP INT TERM
+  scope_input="$scope_root/large.txt"
+
+  # One byte above HIGHLIGHT_SIZE_MAX exercises the cross-platform stat path
+  # and exits before any optional syntax highlighter is needed.
+  dd if=/dev/zero bs=262144 count=1 2>/dev/null | LC_ALL=C tr '\000' x >"$scope_input"
+  scope_stderr=$(
+    home/dot_config/ranger/executable_scope.sh \
+      "$scope_input" 80 24 "$scope_root/cache.jpg" False \
+      2>&1 >/dev/null
+  )
+  scope_status=$?
+
+  [[ $scope_status == 2 && -z $scope_stderr ]]
+)
+
+check_ranger_font_temp() (
+  set -uo pipefail
+
+  local font_parent
+  local font_root
+  local stub_dir
+  local temp_dir
+  local font_log
+  local font_output
+  local scope_stderr
+  local scope_status
+
+  font_parent=${TMPDIR:-/tmp}
+  font_parent=$(cd -P -- "$font_parent" && pwd -P)
+  font_root=$(mktemp -d "$font_parent/dotfiles-font-preview.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$font_root" "$font_parent" dotfiles-font-preview.' EXIT HUP INT TERM
+  stub_dir="$font_root/bin"
+  temp_dir="$font_root/tmp"
+  font_log="$font_root/fontimage-path"
+  mkdir -p -- "$stub_dir" "$temp_dir"
+
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "%s\\n" application/opentype' \
+    >"$stub_dir/file"
+  # These variables intentionally expand later inside the generated stub.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'output=' \
+    'while [ "$#" -gt 0 ]; do' \
+    '  if [ "$1" = -o ]; then shift; output=$1; break; fi' \
+    '  shift' \
+    'done' \
+    '[ -n "$output" ] || exit 1' \
+    'printf "%s\\n" "$output" > "$FONTIMAGE_LOG"' \
+    'printf preview > "$output"' \
+    >"$stub_dir/fontimage"
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'for argument do output=$argument; done' \
+    'printf converted > "$output"' \
+    >"$stub_dir/convert"
+  chmod 0755 "$stub_dir/file" "$stub_dir/fontimage" "$stub_dir/convert"
+  printf 'font fixture\n' >"$font_root/font.otf"
+
+  scope_stderr=$(
+    PATH="$stub_dir:/usr/bin:/bin" \
+      TMPDIR="$temp_dir" \
+      FONTIMAGE_LOG="$font_log" \
+      home/dot_config/ranger/executable_scope.sh \
+      "$font_root/font.otf" 80 24 "$font_root/cache.png" True \
+      2>&1 >/dev/null
+  )
+  scope_status=$?
+  [[ $scope_status == 6 && -z $scope_stderr ]] || return 1
+  [[ -f $font_log && -f $font_root/cache.png ]] || return 1
+  font_output=$(<"$font_log")
+  [[ $font_output == "$temp_dir"/ranger-font-preview.*/preview.png ]] || return 1
+  [[ ! -e ${font_output%/preview.png} ]] || return 1
+)
+
+check_ranger_media_previews() (
+  set -uo pipefail
+
+  local preview_parent
+  local preview_root
+  local stub_dir
+  local minimal_dir
+  local fixture
+  local mode
+  local output
+  local stderr
+  local status
+
+  preview_parent=${TMPDIR:-/tmp}
+  preview_parent=$(cd -P -- "$preview_parent" && pwd -P)
+  preview_root=$(mktemp -d "$preview_parent/dotfiles-ranger-media.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$preview_root" "$preview_parent" dotfiles-ranger-media.' EXIT HUP INT TERM
+  stub_dir="$preview_root/bin"
+  minimal_dir="$preview_root/minimal-bin"
+  mkdir -p -- "$stub_dir" "$minimal_dir"
+
+  # The generated stubs intentionally expand their variables when executed.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'for argument do file_path=$argument; done' \
+    'case $file_path in' \
+    '  *.mp4) printf "%s\n" video/mp4 ;;' \
+    '  *.pdf) printf "%s\n" application/pdf ;;' \
+    '  *.png) printf "%s\n" image/png ;;' \
+    '  *) printf "%s\n" application/octet-stream ;;' \
+    'esac' \
+    >"$stub_dir/file"
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'output=' \
+    'while [ "$#" -gt 0 ]; do' \
+    '  if [ "$1" = -o ]; then shift; output=$1; break; fi' \
+    '  shift' \
+    'done' \
+    '[ -n "$output" ] || exit 1' \
+    'printf thumbnail >"$output"' \
+    >"$stub_dir/ffmpegthumbnailer"
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'for argument do output_base=$argument; done' \
+    'printf preview >"${output_base}.jpg"' \
+    >"$stub_dir/pdftoppm"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "chafa preview\n"' \
+    >"$stub_dir/chafa"
+  for fixture in pdftotext mutool exiftool mediainfo; do
+    printf '%s\n' '#!/bin/sh' 'exit 1' >"$stub_dir/$fixture"
+  done
+  chmod 0755 \
+    "$stub_dir/file" \
+    "$stub_dir/ffmpegthumbnailer" \
+    "$stub_dir/pdftoppm" \
+    "$stub_dir/chafa" \
+    "$stub_dir/pdftotext" \
+    "$stub_dir/mutool" \
+    "$stub_dir/exiftool" \
+    "$stub_dir/mediainfo"
+  printf video >"$preview_root/movie.mp4"
+  printf pdf >"$preview_root/document.pdf"
+  printf image >"$preview_root/image.png"
+  printf font >"$preview_root/font.otf"
+
+  stderr=$(PATH="$stub_dir:/usr/bin:/bin" \
+    home/dot_config/ranger/executable_scope.sh \
+    "$preview_root/movie.mp4" 80 24 "$preview_root/video-cache.jpg" True \
+    2>&1 >/dev/null)
+  status=$?
+  [[ $status == 6 && -z $stderr && -f $preview_root/video-cache.jpg ]] || return 1
+
+  stderr=$(PATH="$stub_dir:/usr/bin:/bin" \
+    home/dot_config/ranger/executable_scope.sh \
+    "$preview_root/document.pdf" 80 24 "$preview_root/pdf-cache.jpg" True \
+    2>&1 >/dev/null)
+  status=$?
+  [[ $status == 6 && -z $stderr && -f $preview_root/pdf-cache.jpg ]] || return 1
+
+  for fixture in image.png movie.mp4 document.pdf; do
+    output=$(PATH="$stub_dir:/usr/bin:/bin" \
+      home/dot_config/ranger/executable_scope.sh \
+      "$preview_root/$fixture" 80 24 "$preview_root/text-cache.jpg" False \
+      2>"$preview_root/text.stderr")
+    status=$?
+    stderr=$(<"$preview_root/text.stderr")
+    [[ $status == 4 && $output == 'chafa preview' && -z $stderr ]] || return 1
+  done
+
+  # A deliberately minimal PATH proves that every enabled media branch stays
+  # quiet when its optional commands are absent.
+  ln -s "$(command -v bash)" "$minimal_dir/bash"
+  ln -s "$(command -v tr)" "$minimal_dir/tr"
+  cp "$stub_dir/file" "$minimal_dir/file"
+  for fixture in image.png movie.mp4 document.pdf font.otf; do
+    for mode in False True; do
+      output=$(PATH="$minimal_dir" \
+        home/dot_config/ranger/executable_scope.sh \
+        "$preview_root/$fixture" 80 24 "$preview_root/missing-cache.jpg" "$mode" \
+        2>"$preview_root/missing.stderr")
+      status=$?
+      stderr=$(<"$preview_root/missing.stderr")
+      [[ -z $stderr ]] || return 1
+      case "$fixture:$mode" in
+      image.png:True)
+        [[ $status == 7 ]] || return 1
+        ;;
+      *)
+        [[ $status == 5 && $output == *'File Type Classification'* ]] || return 1
+        ;;
+      esac
+    done
+  done
+)
+
+check_ranger_config() {
+  local config=home/dot_config/ranger/rc.conf
+
+  grep -Fxq 'set use_preview_script true' "$config"
+  grep -Fxq 'set preview_script ~/.config/ranger/scope.sh' "$config"
+  grep -Fxq 'set preview_images false' "$config"
+  grep -Fxq 'map uT shell -w if command -v trash-restore >/dev/null 2>&1; then trash-restore; else printf '\''trash-restore is unavailable\n'\'' >&2; fi' "$config"
+  if grep -Eq '^map d[tT] ' "$config"; then
+    return 1
+  fi
+  if grep -Eq '^set preview_images_method ' "$config"; then
+    return 1
+  fi
+}
+
+check_ranger_config_parse() (
+  set -euo pipefail
+
+  local parse_parent
+  local parse_root
+
+  parse_parent=${TMPDIR:-/tmp}
+  parse_parent=$(cd -P -- "$parse_parent" && pwd -P)
+  parse_root=$(mktemp -d "$parse_parent/dotfiles-ranger-parse.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$parse_root" "$parse_parent" dotfiles-ranger-parse.' EXIT HUP INT TERM
+  mkdir -p -- "$parse_root/cache" "$parse_root/data" "$parse_root/root"
+
+  python3 - \
+    "$(command -v ranger)" \
+    "$repo_root/home/dot_config/ranger" \
+    "$parse_root" <<'PY'
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+ranger, config, root = sys.argv[1:]
+argv = [
+    ranger,
+    f"--confdir={config}",
+    f"--cachedir={root}/cache",
+    f"--datadir={root}/data",
+    "--cmd=quit!",
+    f"{root}/root",
+]
+environment = os.environ.copy()
+environment.update({"HOME": f"{root}/home", "TERM": "xterm-256color"})
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve(ranger, argv, environment)
+
+output = bytearray()
+deadline = time.monotonic() + 10
+status = None
+try:
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if ready:
+            try:
+                output.extend(os.read(fd, 65536))
+            except OSError:
+                pass
+        waited, child_status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            status = child_status
+            break
+    if status is None:
+        os.killpg(pid, signal.SIGTERM)
+        time.sleep(0.2)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        _, status = os.waitpid(pid, 0)
+finally:
+    os.close(fd)
+
+if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+    raise SystemExit("ranger did not exit cleanly after loading rc.conf")
+decoded = output.decode("utf-8", errors="replace")
+for marker in ("Error in line", "Unknown command", "Traceback"):
+    if marker in decoded:
+        raise SystemExit(f"ranger reported a configuration error: {marker}")
+PY
+)
+
+check_chezmoi_profile() (
+  set -euo pipefail
+
+  local linux_x11=$1
+  local chezmoi_executable
+  local integration_parent
+  local integration_root
+  local destination
+  local backup_parent
+  local bootstrap_log
+  local config_snapshot
+  local profile_flag
+  local profile_data
+  local managed_output
+  local dry_run_output
+  local target
+  local -a cm
+  local -a core_targets
+  local -a x11_targets
+
+  chezmoi_executable=$(command -v chezmoi)
+  [[ $chezmoi_executable == /* ]]
+
+  integration_parent=${TMPDIR:-/tmp}
+  integration_parent=$(cd -P -- "$integration_parent" && pwd -P)
+  integration_root=$(mktemp -d "$integration_parent/dotfiles-check.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$integration_root" "$integration_parent" dotfiles-check.' EXIT HUP INT TERM
+
+  destination="$integration_root/destination"
+  backup_parent="$integration_root/backups"
+  bootstrap_log="$integration_root/bootstrap.log"
+  mkdir -p -- "$destination" "$backup_parent"
+
+  if [[ $linux_x11 == true ]]; then
+    profile_flag=--linux-x11
+    profile_data=true
+  else
+    profile_flag=--no-linux-x11
+    profile_data=false
+  fi
+
+  if ! "$repo_root/scripts/bootstrap" \
+    --apply \
+    --non-interactive \
+    "$profile_flag" \
+    --destination "$destination" \
+    --backup-parent "$backup_parent" \
+    --chezmoi "$chezmoi_executable" \
+    >"$bootstrap_log" 2>&1; then
+    printf 'chezmoi bootstrap integration failed:\n' >&2
+    command cat "$bootstrap_log" >&2
+    return 1
+  fi
+
+  # Bootstrap must not regenerate and truncate valid local chezmoi settings
+  # after the first initialization.
+  printf '\n[diff]\npager = "cat"\n' >>"$destination/.config/chezmoi/chezmoi.toml"
+  config_snapshot="$integration_root/chezmoi.toml.before-preview"
+  cp "$destination/.config/chezmoi/chezmoi.toml" "$config_snapshot"
+  if ! "$repo_root/scripts/bootstrap" \
+    --non-interactive \
+    "$profile_flag" \
+    --destination "$destination" \
+    --backup-parent "$backup_parent" \
+    --chezmoi "$chezmoi_executable" \
+    >"$bootstrap_log" 2>&1; then
+    printf 'same-source chezmoi preview failed:\n' >&2
+    command cat "$bootstrap_log" >&2
+    return 1
+  fi
+  cmp "$config_snapshot" "$destination/.config/chezmoi/chezmoi.toml"
+
+  if [[ $linux_x11 == true ]]; then
+    # On Linux, non-interactive daily use without a profile flag must respect
+    # the persisted true value instead of silently overriding it to false.
+    if ! "$repo_root/scripts/bootstrap" \
+      --non-interactive \
+      --destination "$destination" \
+      --backup-parent "$backup_parent" \
+      --chezmoi "$chezmoi_executable" \
+      >"$bootstrap_log" 2>&1; then
+      printf 'persisted Linux X11 profile preview failed:\n' >&2
+      command cat "$bootstrap_log" >&2
+      return 1
+    fi
+    cmp "$config_snapshot" "$destination/.config/chezmoi/chezmoi.toml"
+    managed_output=$(
+      "$chezmoi_executable" \
+        --source "$repo_root" \
+        --destination "$destination" \
+        --config "$destination/.config/chezmoi/chezmoi.toml" \
+        --config-format toml \
+        --cache "$destination/.cache/chezmoi" \
+        --persistent-state "$destination/.local/state/chezmoi/chezmoistate.boltdb" \
+        managed --format= --include=files --path-style=relative
+    )
+    grep -Fxq '.config/i3/config' <<<"$managed_output"
+    grep -Fxq '.config/picom/picom.conf' <<<"$managed_output"
+  fi
+
+  grep -Fxq "linuxX11 = $profile_data" \
+    "$destination/.config/chezmoi/chezmoi.toml"
+
+  cm=(
+    "$chezmoi_executable"
+    --source "$repo_root"
+    --destination "$destination"
+    --config "$destination/.config/chezmoi/chezmoi.toml"
+    --config-format toml
+    --cache "$destination/.cache/chezmoi"
+    --persistent-state "$destination/.local/state/chezmoi/chezmoistate.boltdb"
+    --override-data "{\"profiles\":{\"linuxX11\":$profile_data}}"
+    --no-tty
+  )
+
+  "${cm[@]}" verify
+
+  core_targets=(
+    .config/alacritty/alacritty.toml
+    .config/fish/config.fish
+    .config/nvim/init.lua
+    .config/ranger/rc.conf
+    .config/ranger/scope.sh
+    .config/tmux/tmux.conf
+  )
+  for target in "${core_targets[@]}"; do
+    [[ -f $destination/$target ]]
+  done
+  [[ -x $destination/.config/ranger/scope.sh ]]
+  [[ ! -e $destination/.config/fish/fish_variables ]]
+
+  x11_targets=(
+    .Xmodmap
+    .Xresources
+    .xinitrc
+    .xprofile
+    .config/i3/config
+    .config/picom/picom.conf
+  )
+  if [[ $linux_x11 == true ]]; then
+    for target in "${x11_targets[@]}"; do
+      [[ -f $destination/$target ]]
+    done
+    [[ -x $destination/.xinitrc ]]
+  else
+    for target in "${x11_targets[@]}"; do
+      [[ ! -e $destination/$target && ! -L $destination/$target ]]
+    done
+  fi
+
+  dry_run_output=$("${cm[@]}" --no-pager --dry-run apply 2>&1)
+  if [[ -n $dry_run_output ]]; then
+    printf 'second chezmoi apply --dry-run was not empty:\n%s\n' "$dry_run_output" >&2
+    return 1
+  fi
+)
+
+check_chezmoi_migration_restore() (
+  set -euo pipefail
+
+  local chezmoi_executable
+  local migration_parent
+  local migration_root
+  local destination
+  local backup_parent
+  local bootstrap_log
+  local backup_dir=
+  local backup_count=0
+  local candidate
+  local original_fish
+  local original_link='../../original-tmux.conf'
+
+  chezmoi_executable=$(command -v chezmoi)
+  [[ $chezmoi_executable == /* ]]
+
+  migration_parent=${TMPDIR:-/tmp}
+  migration_parent=$(cd -P -- "$migration_parent" && pwd -P)
+  migration_root=$(mktemp -d "$migration_parent/dotfiles-migration.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$migration_root" "$migration_parent" dotfiles-migration.' EXIT HUP INT TERM
+
+  destination="$migration_root/destination"
+  backup_parent="$migration_root/backups"
+  bootstrap_log="$migration_root/bootstrap.log"
+  original_fish="$migration_root/original-fish-config"
+  mkdir -p -- "$destination/.config/fish/conf.d" "$destination/.config/tmux" "$backup_parent"
+  chmod 0700 "$destination/.config" "$destination/.config/fish"
+  printf 'pre-existing fish config\n' >"$original_fish"
+  cp "$original_fish" "$destination/.config/fish/config.fish"
+  printf 'symlink payload\n' >"$destination/original-tmux.conf"
+  ln -s "$original_link" "$destination/.config/tmux/tmux.conf"
+  printf 'legacy z plugin\n' >"$destination/.config/fish/conf.d/z.fish"
+  printf 'legacy Fisher manifest\n' >"$destination/.config/fish/fish_plugins"
+
+  # Without a TTY or explicit force, pre-existing targets must remain intact.
+  if "$repo_root/scripts/bootstrap" \
+    --apply \
+    --non-interactive \
+    --no-linux-x11 \
+    --destination "$destination" \
+    --backup-parent "$backup_parent" \
+    --chezmoi "$chezmoi_executable" \
+    >"$bootstrap_log" 2>&1; then
+    printf 'non-interactive migration unexpectedly overwrote without --force\n' >&2
+    return 1
+  fi
+  cmp "$original_fish" "$destination/.config/fish/config.fish"
+  [[ -L $destination/.config/tmux/tmux.conf ]]
+  [[ $(readlink "$destination/.config/tmux/tmux.conf") == "$original_link" ]]
+  [[ -f $destination/.config/fish/conf.d/z.fish ]]
+  [[ -f $destination/.config/fish/fish_plugins ]]
+
+  if ! "$repo_root/scripts/bootstrap" \
+    --apply \
+    --force \
+    --clean-legacy \
+    --non-interactive \
+    --no-linux-x11 \
+    --destination "$destination" \
+    --backup-parent "$backup_parent" \
+    --chezmoi "$chezmoi_executable" \
+    >"$bootstrap_log" 2>&1; then
+    printf 'forced migration bootstrap failed:\n' >&2
+    command cat "$bootstrap_log" >&2
+    return 1
+  fi
+
+  for candidate in "$backup_parent"/backup-*; do
+    [[ -d $candidate ]] || continue
+    backup_count=$((backup_count + 1))
+    if grep -Fqx $'present\t.config/fish/conf.d/z.fish' "$candidate/manifest.tsv"; then
+      backup_dir=$candidate
+    fi
+  done
+  # The safe failed attempt and the forced attempt both retain a recoverable
+  # pre-apply backup.
+  [[ $backup_count == 2 && -n $backup_dir ]]
+  grep -Fqx $'present\t.config/fish/config.fish' "$backup_dir/manifest.tsv"
+  grep -Fqx $'present\t.config/tmux/tmux.conf' "$backup_dir/manifest.tsv"
+  grep -Fqx $'present\t.config/fish/conf.d/z.fish' "$backup_dir/manifest.tsv"
+  grep -Fqx $'present\t.config/fish/fish_plugins' "$backup_dir/manifest.tsv"
+  grep -Fqx $'directory\t.config\t700' "$backup_dir/manifest.tsv"
+  grep -Fqx $'directory\t.config/fish\t700' "$backup_dir/manifest.tsv"
+  cmp "$repo_root/home/dot_config/fish/config.fish" "$destination/.config/fish/config.fish"
+  [[ ! -L $destination/.config/tmux/tmux.conf ]]
+  [[ ! -e $destination/.config/fish/conf.d/z.fish ]]
+  [[ ! -e $destination/.config/fish/fish_plugins ]]
+
+  # Preview is read-only and the first apply restore keeps newly-created files.
+  "$repo_root/scripts/restore" "$backup_dir" >"$migration_root/restore-preview.log" 2>&1
+  cmp "$repo_root/home/dot_config/fish/config.fish" "$destination/.config/fish/config.fish"
+  "$repo_root/scripts/restore" --apply "$backup_dir" >"$migration_root/restore-apply.log" 2>&1
+  cmp "$original_fish" "$destination/.config/fish/config.fish"
+  [[ -L $destination/.config/tmux/tmux.conf ]]
+  [[ $(readlink "$destination/.config/tmux/tmux.conf") == "$original_link" ]]
+  [[ -f $destination/.config/nvim/init.lua ]]
+  grep -Fqx 'legacy z plugin' "$destination/.config/fish/conf.d/z.fish"
+  grep -Fqx 'legacy Fisher manifest' "$destination/.config/fish/fish_plugins"
+  [[ $(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$destination/.config") == 700 ]]
+  [[ $(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$destination/.config/fish") == 700 ]]
+
+  # Removing first-created targets is a separate, explicit restore operation.
+  "$repo_root/scripts/restore" --apply --remove-created "$backup_dir" \
+    >"$migration_root/restore-remove-created.log" 2>&1
+  cmp "$original_fish" "$destination/.config/fish/config.fish"
+  [[ -L $destination/.config/tmux/tmux.conf ]]
+  [[ $(readlink "$destination/.config/tmux/tmux.conf") == "$original_link" ]]
+  [[ ! -e $destination/.config/nvim/init.lua ]]
+  grep -Fqx 'legacy z plugin' "$destination/.config/fish/conf.d/z.fish"
+  grep -Fqx 'legacy Fisher manifest' "$destination/.config/fish/fish_plugins"
+  [[ $(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$destination/.config") == 700 ]]
+  [[ $(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$destination/.config/fish") == 700 ]]
+)
+
+check_chezmoi_interactive_cancel() (
+  set -euo pipefail
+
+  local chezmoi_executable
+  local cancel_parent
+  local cancel_root
+  local destination
+  local backup_parent
+  local cancel_log
+  local original_fish
+
+  chezmoi_executable=$(command -v chezmoi)
+  [[ $chezmoi_executable == /* ]]
+  cancel_parent=${TMPDIR:-/tmp}
+  cancel_parent=$(cd -P -- "$cancel_parent" && pwd -P)
+  cancel_root=$(mktemp -d "$cancel_parent/dotfiles-cancel.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$cancel_root" "$cancel_parent" dotfiles-cancel.' EXIT HUP INT TERM
+
+  destination="$cancel_root/destination"
+  backup_parent="$cancel_root/backups"
+  cancel_log="$cancel_root/bootstrap.log"
+  original_fish="$cancel_root/original-fish-config"
+  mkdir -p -- "$destination/.config/fish" "$backup_parent"
+  chmod 0700 "$destination/.config" "$destination/.config/fish"
+  printf 'pre-existing fish config\n' >"$original_fish"
+  cp "$original_fish" "$destination/.config/fish/config.fish"
+
+  # chezmoi returns success when an interactive user chooses quit. Drive a real
+  # pseudo-terminal and prove the subsequent verify failure is transactional.
+  if ! python3 - \
+    "$repo_root/scripts/bootstrap" \
+    --apply \
+    --no-linux-x11 \
+    --destination "$destination" \
+    --backup-parent "$backup_parent" \
+    --chezmoi "$chezmoi_executable" \
+    >"$cancel_log" 2>&1 <<'PY'
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+argv = sys.argv[1:]
+
+
+def terminate_process_group(pid, term_grace):
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    deadline = time.monotonic() + term_grace
+    status = None
+    while time.monotonic() < deadline:
+        if status is None:
+            waited, child_status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = child_status
+        if status is not None:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return status
+        time.sleep(0.05)
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if status is None:
+        _, status = os.waitpid(pid, 0)
+    return status
+
+
+def drive_pty(argv, expected, response, timeout, term_grace, stream_output):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(argv[0], argv)
+
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    sent_response = False
+    status = None
+    timed_out = False
+
+    try:
+        while status is None:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                status = terminate_process_group(pid, term_grace)
+                break
+
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    data = b""
+                if data:
+                    if stream_output:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+                    output.extend(data)
+                    if not sent_response and expected in output:
+                        os.write(fd, response)
+                        sent_response = True
+
+            waited, child_status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = child_status
+    finally:
+        os.close(fd)
+
+    return status, sent_response, timed_out, bytes(output)
+
+
+status, sent_quit, timed_out, _ = drive_pty(
+    argv,
+    b"already exists?",
+    b"q\n",
+    timeout=60,
+    term_grace=5,
+    stream_output=True,
+)
+if timed_out:
+    raise SystemExit("timed out waiting for the chezmoi conflict prompt")
+if not sent_quit:
+    raise SystemExit("chezmoi conflict prompt was not observed")
+if os.waitstatus_to_exitcode(status) == 0:
+    raise SystemExit("bootstrap unexpectedly succeeded after interactive quit")
+
+# Exercise the timeout's bounded SIGKILL fallback with a stubborn process
+# group, without making the normal regression path wait for the long deadline.
+probe = (
+    "import os, signal, time; "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "child = os.fork(); "
+    "child == 0 and signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "print('probe-ready', flush=True); "
+    "time.sleep(60)"
+)
+_, _, probe_timed_out, probe_output = drive_pty(
+    [sys.executable, "-c", probe],
+    b"never-send-a-response",
+    b"",
+    timeout=0.2,
+    term_grace=0.2,
+    stream_output=False,
+)
+if not probe_timed_out or b"probe-ready" not in probe_output:
+    raise SystemExit("PTY process-group timeout regression failed")
+PY
+  then
+    printf 'interactive cancel regression failed:\n' >&2
+    command cat "$cancel_log" >&2
+    return 1
+  fi
+
+  cmp "$original_fish" "$destination/.config/fish/config.fish"
+  [[ $(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$destination/.config") == 700 ]]
+  [[ $(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$destination/.config/fish") == 700 ]]
+  [[ ! -e $destination/.config/alacritty/alacritty.toml ]]
+  [[ ! -e $destination/.config/nvim/init.lua ]]
+  [[ $(find "$backup_parent" -mindepth 1 -maxdepth 1 -type d -name 'backup-*' | wc -l | tr -d ' ') == 1 ]]
+  grep -Fq 'Post-apply verification failed or the interactive migration was cancelled' "$cancel_log"
+  grep -Fq 'Automatic rollback completed' "$cancel_log"
+)
+
+check_signal_exit_contracts() (
+  set -euo pipefail
+
+  local chezmoi_executable
+  local signal_parent
+  local signal_root
+  local active_pid=
+  local active_release=
+  local bootstrap_destination
+  local bootstrap_backup_parent
+  local bootstrap_marker
+  local bootstrap_release
+  local bootstrap_log
+  local bootstrap_pid
+  local bootstrap_status
+  local original_fish
+  local backup_destination
+  local backup_parent
+  local backup_paths
+  local backup_marker
+  local backup_release
+  local backup_log
+  local backup_output
+  local backup_pid
+  local backup_status
+  local restore_backup
+  local restore_marker
+  local restore_release
+  local restore_log
+  local restore_pid
+  local restore_status
+  local installer_bin
+  local installer_marker
+  local installer_release
+  local installer_log
+  local installer_pid
+  local installer_status
+  local real_cp
+
+  wait_for_marker() {
+    local marker=$1
+    local pid=$2
+    local count
+
+    for ((count = 0; count < 300; count++)); do
+      [[ -e $marker ]] && return 0
+      kill -0 "$pid" 2>/dev/null || return 1
+      sleep 0.1
+    done
+    return 1
+  }
+
+  # shellcheck disable=SC2317,SC2329
+  cleanup_signal_contracts() {
+    if [[ -n $active_pid ]] && kill -0 "$active_pid" 2>/dev/null; then
+      [[ -z $active_release ]] || : >"$active_release"
+      kill -TERM "$active_pid" 2>/dev/null || true
+      wait "$active_pid" 2>/dev/null || true
+    fi
+    dotfiles_safe_cleanup_tree "$signal_root" "$signal_parent" dotfiles-signals.
+  }
+
+  chezmoi_executable=$(command -v chezmoi)
+  real_cp=$(command -v cp)
+  [[ $chezmoi_executable == /* && $real_cp == /* ]]
+  signal_parent=${TMPDIR:-/tmp}
+  signal_parent=$(cd -P -- "$signal_parent" && pwd -P)
+  signal_root=$(mktemp -d "$signal_parent/dotfiles-signals.XXXXXXXX")
+  trap cleanup_signal_contracts EXIT HUP INT TERM
+
+  mkdir -p -- "$signal_root/mock-chezmoi" "$signal_root/mock-cp"
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'is_apply=0' \
+    'for argument in "$@"; do' \
+    '  [[ $argument != apply ]] || is_apply=1' \
+    'done' \
+    '"$DOTFILES_TEST_REAL_CHEZMOI" "$@"' \
+    'status=$?' \
+    'if ((is_apply == 1 && status == 0)); then' \
+    '  : >"$DOTFILES_TEST_MARKER"' \
+    '  for ((index = 0; index < 300; index++)); do' \
+    '    [[ ! -e $DOTFILES_TEST_RELEASE ]] || exit "$status"' \
+    '    sleep 0.1' \
+    '  done' \
+    '  exit 124' \
+    'fi' \
+    'exit "$status"' \
+    >"$signal_root/mock-chezmoi/chezmoi"
+  chmod 0755 "$signal_root/mock-chezmoi/chezmoi"
+
+  # Signal the bootstrap main PID only after the child chezmoi apply has
+  # written managed targets. Bash delivers the pending trap when the child
+  # returns; the handler must rollback and exit 143 instead of verifying and
+  # printing success.
+  bootstrap_destination="$signal_root/bootstrap-destination"
+  bootstrap_backup_parent="$signal_root/bootstrap-backups"
+  bootstrap_marker="$signal_root/bootstrap-applied"
+  bootstrap_release="$signal_root/bootstrap-release"
+  bootstrap_log="$signal_root/bootstrap.log"
+  original_fish="$signal_root/original-fish"
+  mkdir -p -- "$bootstrap_destination/.config/fish" "$bootstrap_backup_parent"
+  printf 'pre-signal fish config\n' >"$original_fish"
+  cp "$original_fish" "$bootstrap_destination/.config/fish/config.fish"
+
+  DOTFILES_TEST_REAL_CHEZMOI="$chezmoi_executable" \
+    DOTFILES_TEST_MARKER="$bootstrap_marker" \
+    DOTFILES_TEST_RELEASE="$bootstrap_release" \
+    "$repo_root/scripts/bootstrap" \
+      --apply \
+      --force \
+      --non-interactive \
+      --no-linux-x11 \
+      --destination "$bootstrap_destination" \
+      --backup-parent "$bootstrap_backup_parent" \
+      --chezmoi "$signal_root/mock-chezmoi/chezmoi" \
+      >"$bootstrap_log" 2>&1 &
+  bootstrap_pid=$!
+  active_pid=$bootstrap_pid
+  active_release=$bootstrap_release
+  wait_for_marker "$bootstrap_marker" "$bootstrap_pid"
+  cmp "$repo_root/home/dot_config/fish/config.fish" \
+    "$bootstrap_destination/.config/fish/config.fish"
+  kill -TERM "$bootstrap_pid"
+  : >"$bootstrap_release"
+  if wait "$bootstrap_pid"; then
+    bootstrap_status=0
+  else
+    bootstrap_status=$?
+  fi
+  active_pid=
+  active_release=
+
+  [[ $bootstrap_status == 143 ]]
+  cmp "$original_fish" "$bootstrap_destination/.config/fish/config.fish"
+  [[ ! -e $bootstrap_destination/.config/nvim/init.lua ]]
+  grep -Fq 'Apply interrupted by a signal' "$bootstrap_log"
+  grep -Fq 'Automatic rollback completed' "$bootstrap_log"
+  if grep -Fq 'Apply and verification completed successfully.' "$bootstrap_log"; then
+    return 1
+  fi
+
+  # Block cp after it has copied a payload but before the parent shell resumes.
+  # This gives backup and restore a deterministic child phase for TERM tests.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    '"$DOTFILES_TEST_REAL_CP" "$@"' \
+    'status=$?' \
+    ': >"$DOTFILES_TEST_MARKER"' \
+    'for ((index = 0; index < 300; index++)); do' \
+    '  [[ ! -e $DOTFILES_TEST_RELEASE ]] || exit "$status"' \
+    '  sleep 0.1' \
+    'done' \
+    'exit 124' \
+    >"$signal_root/mock-cp/cp"
+  chmod 0755 "$signal_root/mock-cp/cp"
+
+  backup_destination="$signal_root/backup-destination"
+  backup_parent="$signal_root/backup-parent"
+  backup_paths="$signal_root/backup-paths"
+  backup_marker="$signal_root/backup-copied"
+  backup_release="$signal_root/backup-release"
+  backup_log="$signal_root/backup.log"
+  backup_output="$signal_root/backup.out"
+  mkdir -p -- "$backup_destination" "$backup_parent"
+  printf 'backup payload\n' >"$backup_destination/managed"
+  printf 'managed\n' >"$backup_paths"
+
+  PATH="$signal_root/mock-cp:$PATH" \
+    DOTFILES_TEST_REAL_CP="$real_cp" \
+    DOTFILES_TEST_MARKER="$backup_marker" \
+    DOTFILES_TEST_RELEASE="$backup_release" \
+    "$repo_root/scripts/backup" \
+      --destination "$backup_destination" \
+      --output-parent "$backup_parent" \
+      --paths-file "$backup_paths" \
+      >"$backup_output" 2>"$backup_log" &
+  backup_pid=$!
+  active_pid=$backup_pid
+  active_release=$backup_release
+  wait_for_marker "$backup_marker" "$backup_pid"
+  kill -TERM "$backup_pid"
+  : >"$backup_release"
+  if wait "$backup_pid"; then
+    backup_status=0
+  else
+    backup_status=$?
+  fi
+  active_pid=
+  active_release=
+
+  [[ $backup_status == 143 ]]
+  [[ -z $(find "$backup_parent" -mindepth 1 -maxdepth 1 -name 'backup-*' -print -quit) ]]
+  if grep -Fq 'Backed up ' "$backup_log"; then
+    return 1
+  fi
+
+  restore_backup=$(
+    "$repo_root/scripts/backup" \
+      --destination "$backup_destination" \
+      --output-parent "$backup_parent" \
+      --paths-file "$backup_paths" \
+      2>"$signal_root/restore-backup.log"
+  )
+  printf 'changed before interrupted restore\n' >"$backup_destination/managed"
+  restore_marker="$signal_root/restore-copied"
+  restore_release="$signal_root/restore-release"
+  restore_log="$signal_root/restore.log"
+
+  PATH="$signal_root/mock-cp:$PATH" \
+    DOTFILES_TEST_REAL_CP="$real_cp" \
+    DOTFILES_TEST_MARKER="$restore_marker" \
+    DOTFILES_TEST_RELEASE="$restore_release" \
+    "$repo_root/scripts/restore" --apply "$restore_backup" \
+      >"$restore_log" 2>&1 &
+  restore_pid=$!
+  active_pid=$restore_pid
+  active_release=$restore_release
+  wait_for_marker "$restore_marker" "$restore_pid"
+  kill -TERM "$restore_pid"
+  : >"$restore_release"
+  if wait "$restore_pid"; then
+    restore_status=0
+  else
+    restore_status=$?
+  fi
+  active_pid=
+  active_release=
+
+  [[ $restore_status == 143 ]]
+  grep -Fqx 'changed before interrupted restore' "$backup_destination/managed"
+  [[ -z $(find "$backup_destination" -name '.dotfiles-restore.*' -print -quit) ]]
+  if grep -Fq 'Restored ' "$restore_log"; then
+    return 1
+  fi
+
+  # The installer checks an existing executable in a child command. TERM of
+  # the installer main PID must prevent the subsequent already-installed
+  # success path even when that child later reports the pinned version.
+  installer_bin="$signal_root/installer-bin"
+  installer_marker="$signal_root/installer-version-checked"
+  installer_release="$signal_root/installer-release"
+  installer_log="$signal_root/installer.log"
+  mkdir -p -- "$installer_bin"
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    '[[ ${1:-} == --version ]] || exit 64' \
+    ': >"$DOTFILES_TEST_MARKER"' \
+    'for ((index = 0; index < 300; index++)); do' \
+    '  if [[ -e $DOTFILES_TEST_RELEASE ]]; then' \
+    '    printf "%s\\n" "chezmoi version v2.72.0"' \
+    '    exit 0' \
+    '  fi' \
+    '  sleep 0.1' \
+    'done' \
+    'exit 124' \
+    >"$installer_bin/chezmoi"
+  chmod 0755 "$installer_bin/chezmoi"
+
+  DOTFILES_TEST_MARKER="$installer_marker" \
+    DOTFILES_TEST_RELEASE="$installer_release" \
+    "$repo_root/scripts/install-chezmoi" --bin-dir "$installer_bin" \
+      >"$installer_log" 2>&1 &
+  installer_pid=$!
+  active_pid=$installer_pid
+  active_release=$installer_release
+  wait_for_marker "$installer_marker" "$installer_pid"
+  kill -TERM "$installer_pid"
+  : >"$installer_release"
+  if wait "$installer_pid"; then
+    installer_status=0
+  else
+    installer_status=$?
+  fi
+  active_pid=
+  active_release=
+
+  [[ $installer_status == 143 ]]
+  if grep -Fq 'already installed' "$installer_log" ||
+    grep -Fq 'Installed chezmoi' "$installer_log"; then
+    return 1
+  fi
+)
+
+check_chezmoi_clean_legacy_rollback() (
+  set -euo pipefail
+
+  local chezmoi_executable
+  local cleanup_parent
+  local cleanup_root
+  local destination
+  local backup_parent
+  local mock_bin
+  local cleanup_log
+  local original_fisher
+  local original_z
+  local real_rm
+
+  chezmoi_executable=$(command -v chezmoi)
+  real_rm=$(command -v rm)
+  [[ $chezmoi_executable == /* && $real_rm == /* ]]
+  cleanup_parent=${TMPDIR:-/tmp}
+  cleanup_parent=$(cd -P -- "$cleanup_parent" && pwd -P)
+  cleanup_root=$(mktemp -d "$cleanup_parent/dotfiles-clean-rollback.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$cleanup_root" "$cleanup_parent" dotfiles-clean-rollback.' EXIT HUP INT TERM
+
+  destination="$cleanup_root/destination"
+  backup_parent="$cleanup_root/backups"
+  mock_bin="$cleanup_root/mock-bin"
+  cleanup_log="$cleanup_root/bootstrap.log"
+  original_fisher="$cleanup_root/original-fisher"
+  original_z="$cleanup_root/original-z"
+  mkdir -p -- \
+    "$destination/.config/fish/completions" \
+    "$destination/.config/fish/conf.d" \
+    "$backup_parent" \
+    "$mock_bin"
+  printf 'legacy fisher completion\n' >"$original_fisher"
+  printf 'legacy z plugin\n' >"$original_z"
+  cp "$original_fisher" "$destination/.config/fish/completions/fisher.fish"
+  cp "$original_z" "$destination/.config/fish/conf.d/z.fish"
+
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'for argument in "$@"; do' \
+    '  case $argument in' \
+    '    */.config/fish/conf.d/z.fish) exit 73 ;;' \
+    '  esac' \
+    'done' \
+    'exec "$DOTFILES_TEST_REAL_RM" "$@"' \
+    >"$mock_bin/rm"
+  chmod 0755 "$mock_bin/rm"
+
+  if PATH="$mock_bin:$PATH" DOTFILES_TEST_REAL_RM="$real_rm" \
+    "$repo_root/scripts/bootstrap" \
+      --apply \
+      --force \
+      --clean-legacy \
+      --non-interactive \
+      --no-linux-x11 \
+      --destination "$destination" \
+      --backup-parent "$backup_parent" \
+      --chezmoi "$chezmoi_executable" \
+      >"$cleanup_log" 2>&1; then
+    printf 'bootstrap unexpectedly succeeded after a mid-cleanup deletion failure\n' >&2
+    return 1
+  fi
+
+  cmp "$original_fisher" "$destination/.config/fish/completions/fisher.fish"
+  cmp "$original_z" "$destination/.config/fish/conf.d/z.fish"
+  [[ ! -e $destination/.config/nvim/init.lua ]]
+  grep -Fq 'Retired Fish cleanup failed' "$cleanup_log"
+  grep -Fq 'Automatic rollback completed' "$cleanup_log"
+  if grep -Fq 'Apply and verification completed successfully.' "$cleanup_log"; then
+    return 1
+  fi
+)
+
+check_chezmoi_destination_symlink_safety() (
+  set -euo pipefail
+
+  local chezmoi_executable
+  local safety_parent
+  local safety_root
+  local destination
+  local outside
+  local backup_destination
+  local backup_outside
+  local bootstrap_log
+  local backup_log
+
+  chezmoi_executable=$(command -v chezmoi)
+  [[ $chezmoi_executable == /* ]]
+  safety_parent=${TMPDIR:-/tmp}
+  safety_parent=$(cd -P -- "$safety_parent" && pwd -P)
+  safety_root=$(mktemp -d "$safety_parent/dotfiles-bootstrap-safety.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$safety_root" "$safety_parent" dotfiles-bootstrap-safety.' EXIT HUP INT TERM
+
+  destination="$safety_root/destination"
+  outside="$safety_root/outside"
+  bootstrap_log="$safety_root/bootstrap.log"
+  mkdir -p -- "$destination" "$outside"
+  ln -s "$outside" "$destination/.config"
+
+  if "$repo_root/scripts/bootstrap" \
+    --non-interactive \
+    --no-linux-x11 \
+    --destination "$destination" \
+    --chezmoi "$chezmoi_executable" \
+    >"$bootstrap_log" 2>&1; then
+    printf 'bootstrap preview unexpectedly followed a destination parent symlink\n' >&2
+    return 1
+  fi
+
+  [[ -L $destination/.config ]]
+  [[ $(readlink "$destination/.config") == "$outside" ]]
+  [[ -z $(find "$outside" -mindepth 1 -maxdepth 1 -print -quit) ]]
+  [[ ! -e $destination/.cache && ! -L $destination/.cache ]]
+  [[ ! -e $destination/.local && ! -L $destination/.local ]]
+  grep -Fq "refusing symlinked parent: $destination/.config" "$bootstrap_log"
+
+  # With an explicit destination, the implicit backup parent is
+  # destination-local. Its complete parent chain must be validated before
+  # bootstrap creates config/cache/state paths or initializes chezmoi.
+  backup_destination="$safety_root/backup-destination"
+  backup_outside="$safety_root/backup-outside"
+  backup_log="$safety_root/backup-boundary.log"
+  mkdir -p -- "$backup_destination/.local/state" "$backup_outside"
+  ln -s "$backup_outside" "$backup_destination/.local/state/dotfiles"
+
+  if "$repo_root/scripts/bootstrap" \
+    --non-interactive \
+    --no-linux-x11 \
+    --destination "$backup_destination" \
+    --chezmoi "$chezmoi_executable" \
+    >"$backup_log" 2>&1; then
+    printf 'bootstrap preview unexpectedly followed the default backup parent symlink\n' >&2
+    return 1
+  fi
+
+  [[ -L $backup_destination/.local/state/dotfiles ]]
+  [[ $(readlink "$backup_destination/.local/state/dotfiles") == "$backup_outside" ]]
+  [[ -z $(find "$backup_outside" -mindepth 1 -maxdepth 1 -print -quit) ]]
+  [[ ! -e $backup_destination/.config && ! -L $backup_destination/.config ]]
+  [[ ! -e $backup_destination/.cache && ! -L $backup_destination/.cache ]]
+  [[ ! -e $backup_destination/.local/state/chezmoi && ! -L $backup_destination/.local/state/chezmoi ]]
+  grep -Fq "refusing symlinked parent: $backup_destination/.local/state/dotfiles" "$backup_log"
+)
+
+check_restore_symlink_directory_safety() (
+  set -euo pipefail
+
+  local restore_parent
+  local restore_root
+  local destination
+  local paths_file
+  local backup_dir
+  local outside
+
+  restore_parent=${TMPDIR:-/tmp}
+  restore_parent=$(cd -P -- "$restore_parent" && pwd -P)
+  restore_root=$(mktemp -d "$restore_parent/dotfiles-restore-safety.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$restore_root" "$restore_parent" dotfiles-restore-safety.' EXIT HUP INT TERM
+  destination="$restore_root/destination"
+  outside="$restore_root/outside"
+  paths_file="$restore_root/paths"
+  mkdir -p -- "$destination" "$restore_root/backups" "$outside"
+  printf 'original\n' >"$destination/managed-file"
+  ln -s "$outside" "$destination/managed-link"
+  printf 'managed-file\nmanaged-link\n' >"$paths_file"
+
+  backup_dir=$("$repo_root/scripts/backup" \
+    --paths-file "$paths_file" \
+    --destination "$destination" \
+    --output-parent "$restore_root/backups" \
+    2>"$restore_root/backup.log")
+
+  rm -f -- "$destination/managed-file" "$destination/managed-link"
+  ln -s "$outside" "$destination/managed-file"
+  printf 'changed\n' >"$destination/managed-link"
+
+  "$repo_root/scripts/restore" --apply "$backup_dir" >"$restore_root/restore.log" 2>&1
+  [[ -f $destination/managed-file && ! -L $destination/managed-file ]]
+  [[ $(cat "$destination/managed-file") == original ]]
+  [[ -L $destination/managed-link ]]
+  [[ $(readlink "$destination/managed-link") == "$outside" ]]
+  [[ -z $(find "$outside" -mindepth 1 -maxdepth 1 -print -quit) ]]
+)
+
+check_installer_path_shadow() (
+  set -euo pipefail
+
+  local chezmoi_executable
+  local installer_parent
+  local installer_root
+  local target_dir
+  local shadow_dir
+  local installer_log
+
+  chezmoi_executable=$(command -v chezmoi)
+  [[ $chezmoi_executable == /* ]]
+
+  installer_parent=${TMPDIR:-/tmp}
+  installer_parent=$(cd -P -- "$installer_parent" && pwd -P)
+  installer_root=$(mktemp -d "$installer_parent/dotfiles-installer.XXXXXXXX")
+  trap 'dotfiles_safe_cleanup_tree "$installer_root" "$installer_parent" dotfiles-installer.' EXIT HUP INT TERM
+  target_dir="$installer_root/target with space"
+  shadow_dir="$installer_root/shadow"
+  installer_log="$installer_root/install.log"
+  mkdir -p -- "$target_dir" "$shadow_dir"
+
+  cp "$chezmoi_executable" "$target_dir/chezmoi"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "%s\\n" "chezmoi version v2.70.0"' \
+    >"$shadow_dir/chezmoi"
+  chmod 0755 "$shadow_dir/chezmoi"
+
+  PATH="$shadow_dir:$PATH" \
+    "$repo_root/scripts/install-chezmoi" --bin-dir "$target_dir" \
+    >"$installer_log" 2>&1
+
+  grep -Fq "PATH currently resolves chezmoi to $shadow_dir/chezmoi" "$installer_log"
+  grep -Fq -- '--chezmoi' "$installer_log"
+
+  mkdir -p -- "$installer_root/symlink-bin" "$installer_root/outside"
+  ln -s "$installer_root/outside" "$installer_root/symlink-bin/chezmoi"
+  if "$repo_root/scripts/install-chezmoi" \
+    --force \
+    --bin-dir "$installer_root/symlink-bin" \
+    >"$installer_log" 2>&1; then
+    printf 'installer unexpectedly followed a target symlink to a directory\n' >&2
+    return 1
+  fi
+  [[ -L $installer_root/symlink-bin/chezmoi ]]
+  [[ -z $(find "$installer_root/outside" -mindepth 1 -maxdepth 1 -print -quit) ]]
+)
+
+run 'Repository whitespace and final newlines' check_repository_whitespace
+
+if have rg; then
+  run 'No personal absolute paths' check_no_personal_paths
+elif [[ $strict == 1 ]]; then
+  fail 'No personal absolute paths (missing: rg)'
+else
+  skip 'No personal absolute paths (missing: rg)'
+fi
+
+optional bash 'Shell syntax' check_shell
+optional shellcheck 'ShellCheck (owned shell files)' check_shellcheck
+optional bash 'Restore symlink-to-directory entry safety and round trip' check_restore_symlink_directory_safety
+optional fish 'Fish syntax (14 source files)' check_fish
+optional fish_indent 'Fish formatting (7 owned files)' check_fish_format
+optional fish 'Fish XDG empty/relative fallback' check_fish_xdg_defaults
+optional fish 'Fish Go bin path precedence' check_fish_go_path
+if have fish && have git; then
+  run 'Fish prompt branch and dirty-state behavior' check_fish_prompt_behavior
+elif [[ $strict == 1 ]]; then
+  fail 'Fish prompt branch and dirty-state behavior (missing: fish or git)'
+else
+  skip 'Fish prompt branch and dirty-state behavior (missing: fish or git)'
+fi
+if have bash && have fish && have git && have python3; then
+  run 'Local performance benchmark smoke' check_performance_benchmark
+elif [[ $strict == 1 ]]; then
+  fail 'Local performance benchmark smoke (missing: bash, fish, git, or python3)'
+else
+  skip 'Local performance benchmark smoke (missing: bash, fish, git, or python3)'
+fi
+optional python3 'Legacy Fish cleanup manifest' check_legacy_fish_manifest
+optional luac 'Lua syntax' check_lua
+optional lua 'Neovim HSL color conversion' check_hsl_colors
+optional nvim 'Neovim 0.12 API smoke' check_nvim_api
+optional bash 'Neovim setup lock ownership and TERM cleanup' check_nvim_setup_lock_and_signal
+if have nvim && have git && have python3; then
+  run 'Neovim plugin preflight integrity and metadata isolation' check_nvim_preflight_integrity
+elif [[ $strict == 1 ]]; then
+  fail 'Neovim plugin preflight integrity and metadata isolation (missing: nvim, git, or python3)'
+else
+  skip 'Neovim plugin preflight integrity and metadata isolation (missing: nvim, git, or python3)'
+fi
+optional jq 'JSON syntax' check_json
+optional python3 'Neovim lock graph (50 pinned plugins)' check_nvim_lock
+if [[ ${DOTFILES_CHECK_NETWORK:-0} == 1 ]]; then
+  if have nvim && have git && have jq; then
+    run 'Neovim pinned bootstrap and first lock write' check_nvim_bootstrap
+  elif [[ $strict == 1 ]]; then
+    fail 'Neovim pinned bootstrap and first lock write (missing: nvim, git, or jq)'
+  else
+    skip 'Neovim pinned bootstrap and first lock write (missing: nvim, git, or jq)'
+  fi
+else
+  skip 'Neovim pinned bootstrap and first lock write (network canary disabled)'
+fi
+if [[ ${DOTFILES_CHECK_NVIM_FULL:-0} == 1 ]]; then
+  if have nvim && have git && have jq && have python3 && have cc; then
+    run 'Neovim full cold start (50 locked plugins and toolchain)' check_nvim_first_start
+  elif [[ $strict == 1 ]]; then
+    fail 'Neovim full cold start (missing: nvim, git, jq, python3, or C compiler)'
+  else
+    skip 'Neovim full cold start (missing: nvim, git, jq, python3, or C compiler)'
+  fi
+else
+  skip 'Neovim full cold start (full network canary disabled)'
+fi
+optional python3 'TOML syntax and upstream metadata' check_toml
+optional python3 'Solarized Osaka palette consistency and contrast' check_theme
+optional python3 'nvm.fish vendor SHA-256' check_nvm_vendor
+optional python3 'ranger scope vendor SHA-256' check_ranger_vendor
+optional python3 'HSL color helper vendor SHA-256' check_hsl_vendor
+optional tmux 'tmux syntax' check_tmux
+optional file 'ranger text-preview portability' check_ranger_scope
+optional bash 'ranger private font-preview temporary path' check_ranger_font_temp
+optional bash 'ranger image, video, and PDF preview behavior' check_ranger_media_previews
+run 'ranger minimal configuration' check_ranger_config
+if have ranger; then
+  run 'ranger configuration parse' check_ranger_config_parse
+else
+  skip 'ranger configuration parse (missing: ranger)'
+fi
+optional chezmoi 'chezmoi bootstrap destination symlink boundary' check_chezmoi_destination_symlink_safety
+optional chezmoi 'signal exit contracts and interrupted apply rollback' check_signal_exit_contracts
+optional chezmoi 'chezmoi core apply/verify/idempotence' check_chezmoi_profile false
+optional chezmoi 'chezmoi migration backup/force/restore' check_chezmoi_migration_restore
+optional chezmoi 'chezmoi mid-cleanup rollback' check_chezmoi_clean_legacy_rollback
+if have chezmoi && have python3; then
+  run 'chezmoi interactive cancel rollback' check_chezmoi_interactive_cancel
+elif [[ $strict == 1 ]]; then
+  fail 'chezmoi interactive cancel rollback (missing: chezmoi or python3)'
+else
+  skip 'chezmoi interactive cancel rollback (missing: chezmoi or python3)'
+fi
+optional chezmoi 'chezmoi installer PATH-shadow guidance' check_installer_path_shadow
+
+if [[ $(uname -s) == Linux ]]; then
+  optional i3 'i3 configuration' check_i3
+  optional chezmoi 'chezmoi Linux X11 profile and executable targets' check_chezmoi_profile true
+else
+  skip 'i3 configuration (Linux-only)'
+  skip 'chezmoi Linux X11 profile and executable targets (Linux-only)'
+fi
+
+printf '\n%d failure(s), %d skipped check(s)\n' "$failures" "$skips"
+((failures == 0))

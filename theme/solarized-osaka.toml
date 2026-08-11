@@ -1,0 +1,29 @@
+name = "Solarized Osaka"
+source = "https://github.com/craftzdog/solarized-osaka.nvim"
+revision = "f796014c14b1910e08d42cc2077fef34f08e0295"
+license = "Apache-2.0"
+license_path = "third_party/solarized-osaka/LICENSE"
+license_sha256 = "9d6646760f242c7797b148512f0cdaf71ecb6ba6fa9be2a0ca2dc09aec1aed7c"
+
+[primary]
+background = "#001419"
+foreground = "#839395"
+opacity = 0.9
+
+[ansi]
+black = "#001014"
+red = "#db302d"
+green = "#849900"
+yellow = "#b28500"
+blue = "#268bd3"
+magenta = "#d23681"
+cyan = "#29a298"
+white = "#839395"
+
+[ui]
+surface = "#002c38"
+base02 = "#063540"
+base01 = "#576d74"
+base0 = "#9eabac"
+base2 = "#ede7d3"
+white = "#ffffff"

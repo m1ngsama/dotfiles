@@ -1,0 +1,26 @@
+{{- /* Patterns match target paths, not source-state names. */ -}}
+{{- if not (or (eq .chezmoi.os "darwin") (eq .chezmoi.os "linux")) }}
+.config
+.config/**
+{{- end }}
+
+{{- if ne .chezmoi.os "darwin" }}
+.config/tmux/macos.conf
+{{- end }}
+
+{{- $linuxX11 := false -}}
+{{- if hasKey . "profiles" -}}
+{{-   if hasKey .profiles "linuxX11" -}}
+{{-     $linuxX11 = .profiles.linuxX11 -}}
+{{-   end -}}
+{{- end -}}
+{{- if not (and (eq .chezmoi.os "linux") $linuxX11) }}
+.Xmodmap
+.Xresources
+.xinitrc
+.xprofile
+.config/i3
+.config/i3/**
+.config/picom
+.config/picom/**
+{{- end }}

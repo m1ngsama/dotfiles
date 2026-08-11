@@ -1,0 +1,43 @@
+[font]
+size = 16.0
+
+[font.normal]
+family = "JetBrainsMono Nerd Font Mono"
+style = "Regular"
+
+# Install the JetBrainsMono Nerd Font Mono family from Nerd Fonts 3.x.
+
+[window]
+# Alacritty blends only its background; Picom keeps the whole window opaque so
+# glyphs remain crisp and readable.
+opacity = 0.9
+
+# Solarized Osaka terminal palette, derived from the repository's locked
+# solarized-osaka.nvim commit f796014c14b1910e08d42cc2077fef34f08e0295.
+# Normal and bright ANSI slots intentionally match the upstream terminal map.
+[colors]
+transparent_background_colors = false
+
+[colors.primary]
+background = "#001419"
+foreground = "#839395"
+
+[colors.normal]
+black = "#001014"
+red = "#db302d"
+green = "#849900"
+yellow = "#b28500"
+blue = "#268bd3"
+magenta = "#d23681"
+cyan = "#29a298"
+white = "#839395"
+
+[colors.bright]
+black = "#001014"
+red = "#db302d"
+green = "#849900"
+yellow = "#b28500"
+blue = "#268bd3"
+magenta = "#d23681"
+cyan = "#29a298"
+white = "#839395"

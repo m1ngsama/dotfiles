@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+repo_root=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck disable=SC1091
+source "$repo_root/scripts/lib/safety.bash"
+
+samples=100
+nvim_samples=30
+warmups=5
+nvim_data=
+benchmark_root=
+benchmark_parent=
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/benchmark [OPTIONS]
+
+Run startup benchmarks in a temporary HOME and XDG environment.
+
+Options:
+  --samples COUNT       Fish and prompt samples (default: 100)
+  --warmups COUNT       Untimed warm-up iterations (default: 5)
+  --nvim-data DIR       Already-provisioned Neovim stdpath("data") directory
+  --nvim-samples COUNT  Warm Neovim samples (default: 30)
+  -h, --help            Show this help
+
+Neovim is skipped unless --nvim-data names a dedicated, already-provisioned
+data directory. The directory is copied before use and is never modified.
+Neovim benchmark mode disables dependency provisioning. Configured Fish keeps
+installed optional host integrations as explicit benchmark inputs. Results are
+observations; this command does not enforce pass/fail budgets.
+EOF
+}
+
+cleanup() {
+  if [[ -n $benchmark_root && -n $benchmark_parent ]]; then
+    dotfiles_safe_cleanup_tree "$benchmark_root" "$benchmark_parent" dotfiles-benchmark.
+    benchmark_root=
+  fi
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+while (($# > 0)); do
+  case $1 in
+    --samples)
+      (($# >= 2)) || dotfiles_die '--samples requires an argument'
+      samples=$2
+      shift 2
+      ;;
+    --samples=*)
+      samples=${1#*=}
+      shift
+      ;;
+    --warmups)
+      (($# >= 2)) || dotfiles_die '--warmups requires an argument'
+      warmups=$2
+      shift 2
+      ;;
+    --warmups=*)
+      warmups=${1#*=}
+      shift
+      ;;
+    --nvim-data)
+      (($# >= 2)) || dotfiles_die '--nvim-data requires an argument'
+      nvim_data=$2
+      shift 2
+      ;;
+    --nvim-data=*)
+      nvim_data=${1#*=}
+      shift
+      ;;
+    --nvim-samples)
+      (($# >= 2)) || dotfiles_die '--nvim-samples requires an argument'
+      nvim_samples=$2
+      shift 2
+      ;;
+    --nvim-samples=*)
+      nvim_samples=${1#*=}
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      dotfiles_die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ $samples =~ ^[1-9][0-9]*$ ]] || dotfiles_die '--samples must be a positive integer'
+[[ $warmups =~ ^[0-9]+$ ]] || dotfiles_die '--warmups must be a non-negative integer'
+[[ $nvim_samples =~ ^[1-9][0-9]*$ ]] || dotfiles_die '--nvim-samples must be a positive integer'
+
+find_executable() {
+  local executable
+
+  executable=$(type -P "$1" 2>/dev/null || true)
+  [[ -n $executable && $executable == /* && -x $executable ]] ||
+    dotfiles_die "$1 is required"
+  printf '%s\n' "$executable"
+}
+
+python_bin=$(find_executable python3)
+fish_bin=$(find_executable fish)
+git_bin=$(find_executable git)
+uname_bin=$(find_executable uname)
+nvim_bin=$(type -P nvim 2>/dev/null || true)
+if [[ -n $nvim_bin && ($nvim_bin != /* || ! -x $nvim_bin) ]]; then
+  nvim_bin=
+fi
+
+benchmark_parent=${TMPDIR:-/tmp}
+[[ -d $benchmark_parent ]] || dotfiles_die "temporary parent does not exist: $benchmark_parent"
+benchmark_parent=$(cd -P -- "$benchmark_parent" && pwd -P)
+dotfiles_validate_absolute_path "$benchmark_parent" 'temporary parent'
+benchmark_root=$(mktemp -d "$benchmark_parent/dotfiles-benchmark.XXXXXXXX")
+
+benchmark_home="$benchmark_root/home"
+xdg_config="$benchmark_root/xdg/config"
+xdg_data="$benchmark_root/xdg/data"
+xdg_state="$benchmark_root/xdg/state"
+xdg_cache="$benchmark_root/xdg/cache"
+runtime_bin="$benchmark_root/bin"
+nvim_runtime_bin="$benchmark_root/nvim-bin"
+outside_git="$benchmark_root/outside-git"
+git_fixture="$benchmark_root/git-fixture"
+large_git_fixture="$benchmark_root/large-git-fixture"
+git_template="$benchmark_root/git-template"
+
+mkdir -p -- \
+  "$benchmark_home" \
+  "$xdg_config/fish" \
+  "$xdg_data" \
+  "$xdg_state" \
+  "$xdg_cache" \
+  "$runtime_bin" \
+  "$nvim_runtime_bin" \
+  "$outside_git" \
+  "$git_template"
+cp -pPR -- "$repo_root/home/dot_config/fish/." "$xdg_config/fish/"
+
+ln -s -- "$fish_bin" "$runtime_bin/fish"
+ln -s -- "$git_bin" "$runtime_bin/git"
+ln -s -- "$uname_bin" "$runtime_bin/uname"
+# conf.d integrations run before config.fish adds standard package-manager
+# paths. Seed only those existing, declared host paths so the configured Fish
+# measurement and its reported optional integrations describe the same startup.
+benchmark_path=$runtime_bin
+for host_path in \
+  /opt/homebrew/bin \
+  /opt/homebrew/sbin \
+  /usr/local/bin \
+  /usr/local/sbin \
+  /usr/local/mysql/bin; do
+  if [[ -d $host_path ]]; then
+    benchmark_path="$benchmark_path:$host_path"
+  fi
+done
+# Neovim may validate the configured shell, but omitting Git and download tools
+# ensures an incomplete plugin graph cannot turn a benchmark into provisioning.
+ln -s -- "$fish_bin" "$nvim_runtime_bin/fish"
+
+isolated_git() {
+  env -i \
+    HOME="$benchmark_home" \
+    XDG_CONFIG_HOME="$xdg_config" \
+    XDG_DATA_HOME="$xdg_data" \
+    XDG_STATE_HOME="$xdg_state" \
+    XDG_CACHE_HOME="$xdg_cache" \
+    PATH="$runtime_bin" \
+    LC_ALL=C \
+    GIT_ATTR_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_CONFIG_COUNT=3 \
+    GIT_CONFIG_KEY_0=core.hooksPath \
+    GIT_CONFIG_VALUE_0=/dev/null \
+    GIT_CONFIG_KEY_1=core.fsmonitor \
+    GIT_CONFIG_VALUE_1=false \
+    GIT_CONFIG_KEY_2=core.attributesFile \
+    GIT_CONFIG_VALUE_2=/dev/null \
+    "$git_bin" "$@"
+}
+
+isolated_git init --quiet --initial-branch=benchmark \
+  --template="$git_template" "$git_fixture"
+printf 'benchmark fixture\n' >"$git_fixture/tracked.txt"
+isolated_git -C "$git_fixture" add -- tracked.txt
+isolated_git -C "$git_fixture" \
+  -c user.name='Dotfiles Benchmark' \
+  -c user.email=benchmark.invalid \
+  -c commit.gpgsign=false \
+  commit --quiet --no-verify -m 'Create benchmark fixture'
+
+isolated_git init --quiet --initial-branch=benchmark \
+  --template="$git_template" "$large_git_fixture"
+"$python_bin" - "$large_git_fixture" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for directory_index in range(100):
+    directory = root / f"component-{directory_index:03d}"
+    directory.mkdir()
+    for file_index in range(50):
+        (directory / f"file-{file_index:03d}.txt").write_text(
+            "tracked benchmark fixture\n", encoding="utf-8"
+        )
+PY
+isolated_git -C "$large_git_fixture" add -- .
+isolated_git -C "$large_git_fixture" \
+  -c user.name='Dotfiles Benchmark' \
+  -c user.email=benchmark.invalid \
+  -c commit.gpgsign=false \
+  commit --quiet --no-verify -m 'Create large benchmark fixture'
+
+commit=$(isolated_git -C "$repo_root" rev-parse --verify HEAD)
+if [[ -n $(isolated_git -C "$repo_root" status --porcelain --untracked-files=normal) ]]; then
+  worktree_state=dirty
+else
+  worktree_state=clean
+fi
+
+nvim_ready=0
+nvim_reason='pass --nvim-data with an already-provisioned Neovim data directory'
+if [[ -n $nvim_data ]]; then
+  if [[ -z $nvim_bin ]]; then
+    nvim_reason='Neovim is not installed'
+  elif [[ ! -d $nvim_data || -L $nvim_data ]]; then
+    nvim_reason='--nvim-data must be an existing, non-symlink directory'
+  else
+    nvim_source=$(cd -P -- "$nvim_data" && pwd -P)
+    dotfiles_validate_absolute_path "$nvim_source" 'Neovim data directory'
+    mkdir -p -- "$xdg_data/nvim"
+    if cp -pPR -- "$nvim_source/." "$xdg_data/nvim/"; then
+      mkdir -p -- "$xdg_config/nvim"
+      cp -pPR -- "$repo_root/home/dot_config/nvim/." "$xdg_config/nvim/"
+      nvim_preflight=
+      if ! nvim_preflight=$(env -i \
+        HOME="$benchmark_home" \
+        XDG_CONFIG_HOME="$xdg_config" \
+        XDG_DATA_HOME="$xdg_data" \
+        XDG_STATE_HOME="$xdg_state" \
+        XDG_CACHE_HOME="$xdg_cache" \
+        PATH="$runtime_bin" \
+        LC_ALL=C \
+        NVIM_APPNAME=nvim \
+        DOTFILES_NVIM_PREFLIGHT_SCRIPT="$repo_root/scripts/nvim-preflight.lua" \
+        "$nvim_bin" --clean --headless -u NONE \
+          '+lua dofile(vim.env.DOTFILES_NVIM_PREFLIGHT_SCRIPT)' +qa 2>&1); then
+        nvim_reason=${nvim_preflight:-'the isolated Neovim preflight failed'}
+      else
+        nvim_validation=
+        if nvim_validation=$(env -i \
+          HOME="$benchmark_home" \
+          PATH="$runtime_bin" \
+          LC_ALL=C \
+          GIT_ATTR_NOSYSTEM=1 \
+          GIT_CONFIG_GLOBAL=/dev/null \
+          GIT_CONFIG_NOSYSTEM=1 \
+          GIT_NO_REPLACE_OBJECTS=1 \
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_CONFIG_COUNT=3 \
+          GIT_CONFIG_KEY_0=core.hooksPath \
+          GIT_CONFIG_VALUE_0=/dev/null \
+          GIT_CONFIG_KEY_1=core.fsmonitor \
+          GIT_CONFIG_VALUE_1=false \
+          GIT_CONFIG_KEY_2=core.attributesFile \
+          GIT_CONFIG_VALUE_2=/dev/null \
+          "$python_bin" - "$xdg_data/nvim" \
+          "$repo_root/home/dot_config/nvim/lazy-lock.json" "$git_bin" \
+          "$nvim_source" 2>&1 <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+data_root = pathlib.Path(sys.argv[1]).resolve()
+lock_path = pathlib.Path(sys.argv[2])
+git = sys.argv[3]
+source_root = pathlib.Path(sys.argv[4]).resolve()
+
+for directory, names, files in os.walk(data_root, followlinks=False):
+    for name in names + files:
+        path = pathlib.Path(directory, name)
+        if not path.is_symlink():
+            continue
+        link = os.readlink(path)
+        if os.path.isabs(link):
+            source_target = pathlib.Path(os.path.realpath(link))
+            try:
+                relative_target = source_target.relative_to(source_root)
+            except ValueError:
+                raise SystemExit(
+                    f"absolute symlink escapes the source data directory: {path.relative_to(data_root)}"
+                )
+            copied_target = data_root / relative_target
+            if not os.path.lexists(copied_target):
+                raise SystemExit(
+                    f"absolute symlink target was not copied: {path.relative_to(data_root)}"
+                )
+            path.unlink()
+            path.symlink_to(os.path.relpath(copied_target, start=path.parent))
+        target = pathlib.Path(os.path.realpath(path))
+        try:
+            target.relative_to(data_root)
+        except ValueError:
+            raise SystemExit(f"symlink escapes the isolated data directory: {path.relative_to(data_root)}")
+
+with lock_path.open(encoding="utf-8") as handle:
+    lock = json.load(handle)
+if not isinstance(lock, dict) or not lock:
+    raise SystemExit("the repository Neovim lock is empty or invalid")
+
+lazy_root = data_root / "lazy"
+for name, metadata in sorted(lock.items()):
+    if not isinstance(name, str) or not name or "/" in name or name in {".", ".."}:
+        raise SystemExit("the repository Neovim lock contains an unsafe plugin name")
+    expected = metadata.get("commit") if isinstance(metadata, dict) else None
+    if not isinstance(expected, str) or len(expected) != 40:
+        raise SystemExit(f"the repository Neovim lock has an invalid commit for {name}")
+    checkout = lazy_root / name
+    if checkout.is_symlink() or not checkout.is_dir():
+        raise SystemExit(f"the isolated data directory is missing a regular checkout for {name}")
+    result = subprocess.run(
+        [git, "--no-replace-objects", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    actual = result.stdout.strip()
+    if result.returncode != 0 or actual != expected:
+        raise SystemExit(f"the isolated checkout for {name} does not match the repository lock")
+
+print(f"validated {len(lock)} locked plugin checkouts")
+PY
+        ); then
+          nvim_ready=1
+          nvim_reason=$nvim_validation
+        else
+          nvim_reason=${nvim_validation:-'the isolated Neovim data directory failed validation'}
+        fi
+      fi
+    else
+      nvim_reason='the isolated Neovim data directory could not be copied'
+    fi
+  fi
+fi
+
+env -i \
+  HOME="$benchmark_home" \
+  XDG_CONFIG_HOME="$xdg_config" \
+  XDG_DATA_HOME="$xdg_data" \
+  XDG_STATE_HOME="$xdg_state" \
+  XDG_CACHE_HOME="$xdg_cache" \
+  TMPDIR="$benchmark_root" \
+  PATH="$benchmark_path" \
+  LC_ALL=C \
+  TERM=dumb \
+  NO_COLOR=1 \
+  GIT_ATTR_NOSYSTEM=1 \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  GIT_CONFIG_NOSYSTEM=1 \
+  GIT_NO_REPLACE_OBJECTS=1 \
+  GIT_TERMINAL_PROMPT=0 \
+  GIT_CONFIG_COUNT=3 \
+  GIT_CONFIG_KEY_0=core.hooksPath \
+  GIT_CONFIG_VALUE_0=/dev/null \
+  GIT_CONFIG_KEY_1=core.fsmonitor \
+  GIT_CONFIG_VALUE_1=false \
+  GIT_CONFIG_KEY_2=core.attributesFile \
+  GIT_CONFIG_VALUE_2=/dev/null \
+  DOTFILES_BENCHMARK_PROMPT="$repo_root/home/dot_config/fish/functions/fish_prompt.fish" \
+  "$python_bin" - \
+  "$commit" "$worktree_state" \
+  "$samples" "$nvim_samples" "$warmups" \
+  "$fish_bin" "$git_bin" "$outside_git" "$git_fixture" "$large_git_fixture" \
+  "$nvim_bin" "$nvim_ready" "$nvim_reason" "$nvim_runtime_bin" <<'PY'
+import math
+import os
+import platform
+import re
+import statistics
+import subprocess
+import sys
+import time
+
+(
+    commit,
+    worktree_state,
+    sample_text,
+    nvim_sample_text,
+    warmup_text,
+    fish,
+    git,
+    outside_git,
+    git_fixture,
+    large_git_fixture,
+    nvim,
+    nvim_ready_text,
+    nvim_reason,
+    nvim_runtime_bin,
+) = sys.argv[1:]
+
+samples = int(sample_text)
+nvim_samples = int(nvim_sample_text)
+warmups = int(warmup_text)
+nvim_ready = nvim_ready_text == "1"
+base_env = os.environ.copy()
+
+
+def first_line(command, env=None):
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            env=env or base_env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    output = result.stdout.splitlines()
+    return output[0].strip() if output else "unavailable"
+
+
+def configured_fish_integrations():
+    names = ("eza", "ghq+fzf", "lolcat", "thefuck", "zoxide")
+    fish_code = r'''
+function __dotfiles_benchmark_integration
+    printf "__DOTFILES_INTEGRATION__%s\n" $argv[1]
+end
+if functions -q l; and string match -q '*command eza*' -- (functions l)
+    __dotfiles_benchmark_integration eza
+end
+if bind \cg 2>/dev/null | string match -q '*__m1ng_ghq_repository_search*'
+    __dotfiles_benchmark_integration ghq+fzf
+end
+if command -q lolcat; and functions -q fish_greeting
+    __dotfiles_benchmark_integration lolcat
+end
+if functions -q fuck
+    __dotfiles_benchmark_integration thefuck
+end
+if functions -q z
+    __dotfiles_benchmark_integration zoxide
+end
+'''
+    try:
+        result = subprocess.run(
+            [fish, "--interactive", "-c", fish_code],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            env=base_env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    prefix = "__DOTFILES_INTEGRATION__"
+    present = [
+        line[len(prefix) :]
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix) and line[len(prefix) :] in names
+    ]
+    return ", ".join(present) if present else "none"
+
+
+def cpu_model():
+    if sys.platform == "darwin":
+        value = first_line(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"])
+        if value != "unavailable":
+            return value
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.lower().startswith(("model name", "hardware")):
+                        return line.split(":", 1)[1].strip()
+        except (OSError, IndexError):
+            pass
+    return platform.processor() or "unavailable"
+
+
+def memory_total():
+    if sys.platform == "darwin":
+        value = first_line(["/usr/sbin/sysctl", "-n", "hw.memsize"])
+        try:
+            return f"{int(value) / (1024 ** 3):.1f} GiB"
+        except ValueError:
+            return "unavailable"
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemTotal:"):
+                        kib = int(line.split()[1])
+                        return f"{kib / (1024 ** 2):.1f} GiB"
+        except (OSError, ValueError, IndexError):
+            pass
+    return "unavailable"
+
+
+def run_process(command, count, env, timeout):
+    durations = []
+    for index in range(warmups + count):
+        started = time.perf_counter_ns()
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"timed out after {timeout} seconds") from error
+        if result.returncode != 0:
+            raise RuntimeError(f"exited with status {result.returncode}")
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        if index >= warmups:
+            durations.append(elapsed)
+    return durations
+
+
+def run_prompt(directory, count):
+    iterations = warmups + count
+    prompt_env = base_env.copy()
+    prompt_env["DOTFILES_BENCHMARK_ITERATIONS"] = str(iterations)
+    fish_code = r'''
+source "$DOTFILES_BENCHMARK_PROMPT"
+set -l remaining $DOTFILES_BENCHMARK_ITERATIONS
+while test $remaining -gt 0
+    time fish_prompt >/dev/null
+    set remaining (math $remaining - 1)
+end
+'''
+    try:
+        result = subprocess.run(
+            [fish, "--no-config", "-c", fish_code],
+            check=False,
+            cwd=directory,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(30, iterations * 0.5),
+            env=prompt_env,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("timed out while measuring Fish prompt renders") from error
+    if result.returncode != 0:
+        raise RuntimeError(f"Fish prompt measurement exited with status {result.returncode}")
+
+    matches = re.findall(
+        r"^Executed in\s+([0-9]+(?:\.[0-9]+)?)\s+(micros|millis|secs)\b",
+        result.stderr,
+        re.MULTILINE,
+    )
+    if len(matches) != iterations:
+        raise RuntimeError(
+            f"expected {iterations} Fish prompt timings, received {len(matches)}"
+        )
+    scale = {"micros": 0.001, "millis": 1.0, "secs": 1000.0}
+    durations = [float(value) * scale[unit] for value, unit in matches]
+    return durations[warmups:]
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def summary(values, conservative=False):
+    fields = [f"samples={len(values)}", f"min={min(values):.3f}"]
+    fields.append(f"p50={statistics.median(values):.3f}")
+    if not conservative and len(values) >= 20:
+        fields.append(f"p95={percentile(values, 0.95):.3f}")
+    if not conservative and len(values) >= 100:
+        fields.append(f"p99={percentile(values, 0.99):.3f}")
+    fields.append(f"max={max(values):.3f}")
+    return " ".join(fields)
+
+
+try:
+    load = ", ".join(f"{value:.2f}" for value in os.getloadavg())
+except (AttributeError, OSError):
+    load = "unavailable"
+
+print("Benchmark environment")
+print(f"  Commit: {commit} ({worktree_state} worktree)")
+print(f"  OS: {platform.platform()}")
+print(f"  Architecture: {platform.machine() or 'unavailable'}")
+print(f"  CPU: {cpu_model()}")
+print(f"  Logical CPUs: {os.cpu_count() or 'unavailable'}")
+print(f"  Memory: {memory_total()}")
+print(f"  Load average before measurement: {load}")
+print(f"  Python: {platform.python_version()}")
+print(f"  {first_line([fish, '--version'])}")
+print(f"  {first_line([git, '--version'])}")
+if nvim:
+    print(f"  {first_line([nvim, '--version'])}")
+print(f"  Warm-up iterations: {warmups}")
+print("  Isolation: temporary HOME/XDG and sanitized Git configuration")
+print(f"  Active configured Fish integrations: {configured_fish_integrations()}")
+print()
+print("Results (milliseconds, lower is better)")
+
+try:
+    core = run_process(
+        [fish, "--no-config", "--interactive", "-c", "exit"],
+        samples,
+        base_env,
+        10,
+    )
+    configured = run_process(
+        [fish, "--interactive", "-c", "exit"], samples, base_env, 10
+    )
+    outside = run_prompt(outside_git, samples)
+    inside = run_prompt(git_fixture, samples)
+    large = run_prompt(large_git_fixture, samples)
+except (OSError, RuntimeError) as error:
+    print(f"error: Fish benchmark failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"  Fish core startup:        {summary(core)}")
+print(f"  Fish configured startup:  {summary(configured)}")
+print(f"  Prompt outside Git:       {summary(outside)}")
+print(f"  Prompt in small Git repo: {summary(inside)}")
+print(f"  Prompt in 5k-file repo:   {summary(large)}")
+
+if not nvim_ready:
+    print(f"  Warm Neovim startup:     skipped ({nvim_reason})")
+else:
+    nvim_env = base_env.copy()
+    nvim_env.update(
+        {
+            "PATH": nvim_runtime_bin,
+            "NVIM_APPNAME": "nvim",
+            "http_proxy": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "ALL_PROXY": "socks5h://127.0.0.1:9",
+            "NO_PROXY": "localhost,127.0.0.1",
+        }
+    )
+    try:
+        probe = subprocess.run(
+            [nvim, "--cmd", "let g:dotfiles_benchmark = 1", "--headless", "+qa"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            env=nvim_env,
+        )
+        if probe.returncode != 0:
+            raise RuntimeError(f"isolated warm-up exited with status {probe.returncode}")
+        nvim_values = run_process(
+            [nvim, "--cmd", "let g:dotfiles_benchmark = 1", "--headless", "+qa"],
+            nvim_samples,
+            nvim_env,
+            30,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"  Warm Neovim startup:     skipped ({error})")
+    else:
+        conservative = len(nvim_values) < 100
+        print(f"  Warm Neovim startup:     {summary(nvim_values, conservative)}")
+
+print()
+if samples < 100:
+    print("Note: p99 is omitted because fewer than 100 Fish/prompt samples were requested.")
+if nvim_ready and nvim_samples < 100:
+    print("Note: warm Neovim uses median/range below 100 samples; raise --nvim-samples to 100 for tail percentiles.")
+print("Compare results only under similar hardware, power, thermal, and load conditions.")
+print("No absolute pass/fail budget is applied.")
+PY

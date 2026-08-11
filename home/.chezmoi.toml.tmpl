@@ -1,0 +1,11 @@
+{{- $linuxX11 := false -}}
+{{- if eq .chezmoi.os "linux" -}}
+{{-   $linuxX11 = promptBoolOnce . "profiles.linuxX11" "Enable the Linux X11/i3 profile" false -}}
+{{- end -}}
+
+# Generated during first bootstrap. Later bootstrap runs preserve the existing
+# local config instead of regenerating it.
+sourceDir = {{ .chezmoi.workingTree | quote }}
+
+[data.profiles]
+linuxX11 = {{ $linuxX11 }}

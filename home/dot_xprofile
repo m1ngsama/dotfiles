@@ -1,0 +1,5 @@
+#!/bin/sh
+
+if command -v xmodmap >/dev/null 2>&1 && [ -r "$HOME/.Xmodmap" ]; then
+  xmodmap "$HOME/.Xmodmap"
+fi

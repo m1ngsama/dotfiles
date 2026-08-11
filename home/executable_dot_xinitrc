@@ -1,0 +1,17 @@
+#!/bin/sh
+
+export XDG_SESSION_TYPE=x11
+
+# Display managers usually source .xprofile themselves; startx does not do so
+# consistently. Source the managed profile here to keep both entry paths
+# equivalent, then load the managed X resources when xrdb is available.
+if [ -r "$HOME/.xprofile" ]; then
+  # shellcheck disable=SC1090,SC1091
+  . "$HOME/.xprofile"
+fi
+
+if command -v xrdb >/dev/null 2>&1 && [ -r "$HOME/.Xresources" ]; then
+  xrdb -merge "$HOME/.Xresources"
+fi
+
+exec i3

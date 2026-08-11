@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck disable=SC1091
+source "$script_dir/lib/safety.bash"
+
+readonly install_version=2.72.0
+install_force=0
+install_bin_dir=${HOME:+$HOME/.local/bin}
+install_tmp_root=
+install_tmp_parent=
+install_stage=
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/install-chezmoi [--force] [--bin-dir DIR]
+
+Install the repository-pinned chezmoi release after verifying a static SHA-256.
+An existing different version is never replaced unless --force is supplied.
+No privilege escalation or shell-from-network execution is used.
+EOF
+}
+
+cleanup() {
+  if [[ -n $install_stage && -n $install_bin_dir ]]; then
+    case "$install_stage" in
+      "$install_bin_dir"/.chezmoi-install.*)
+        [[ ! -d $install_stage ]] && rm -f -- "$install_stage"
+        ;;
+    esac
+    install_stage=
+  fi
+  if [[ -n $install_tmp_root && -n $install_tmp_parent ]]; then
+    dotfiles_safe_cleanup_tree "$install_tmp_root" "$install_tmp_parent" dotfiles-chezmoi.
+    install_tmp_root=
+  fi
+}
+
+exit_for_signal() {
+  local status=$1
+
+  trap - HUP INT TERM
+  cleanup || true
+  trap - EXIT
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit_for_signal 129' HUP
+trap 'exit_for_signal 130' INT
+trap 'exit_for_signal 143' TERM
+
+chezmoi_is_pinned_version() {
+  local executable=$1
+  local output
+
+  [[ -x $executable && ! -d $executable ]] || return 1
+  output=$("$executable" --version 2>/dev/null) || return 1
+  [[ $output =~ ^chezmoi[[:space:]]version[[:space:]]v?2\.72\.0([,[:space:]]|$) ]]
+}
+
+report_target_resolution() {
+  local resolved
+
+  resolved=$(command -v chezmoi 2>/dev/null || true)
+  if [[ $resolved == "$install_target" ]]; then
+    return 0
+  fi
+
+  if [[ -n $resolved ]]; then
+    printf 'Note: PATH currently resolves chezmoi to %s, before %s.\n' \
+      "$resolved" "$install_target" >&2
+    printf 'Reorder PATH, or bypass the shadowed command with:\n' >&2
+  else
+    printf 'Note: %s is not currently resolved through PATH. Use:\n' \
+      "$install_target" >&2
+  fi
+  printf '  %q --chezmoi %q\n' "$script_dir/bootstrap" "$install_target" >&2
+}
+
+download_asset() {
+  local url=$1
+  local output=$2
+
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --silent --show-error \
+      --proto '=https' --tlsv1.2 \
+      --connect-timeout 15 --max-time 300 \
+      --retry 3 --retry-delay 2 --retry-connrefused \
+      --output "$output" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --https-only --secure-protocol=TLSv1_2 \
+      --timeout=30 --tries=4 --waitretry=2 \
+      --output-document="$output" "$url"
+  else
+    dotfiles_die 'curl or wget is required to download chezmoi'
+  fi
+}
+
+verify_sha256() {
+  local file=$1
+  local expected=$2
+  local actual
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$file" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  else
+    dotfiles_die 'sha256sum or shasum is required to verify chezmoi'
+  fi
+  [[ $actual == "$expected" ]] ||
+    dotfiles_die "SHA-256 mismatch: expected $expected, got $actual"
+}
+
+while (($# > 0)); do
+  case $1 in
+    --force)
+      install_force=1
+      shift
+      ;;
+    --bin-dir)
+      (($# >= 2)) || dotfiles_die '--bin-dir requires an argument'
+      install_bin_dir=$2
+      shift 2
+      ;;
+    --bin-dir=*)
+      install_bin_dir=${1#*=}
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      dotfiles_die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n $install_bin_dir ]] || dotfiles_die 'HOME is unset; pass --bin-dir explicitly'
+dotfiles_validate_absolute_path "$install_bin_dir" 'installation directory'
+install_bin_dir=$(dotfiles_prepare_directory "$install_bin_dir" 'installation directory')
+install_target="$install_bin_dir/chezmoi"
+
+if [[ -d $install_target ]]; then
+  dotfiles_die "installation target resolves to a directory: $install_target"
+fi
+
+if [[ -e $install_target || -L $install_target ]]; then
+  if chezmoi_is_pinned_version "$install_target"; then
+    printf 'chezmoi %s is already installed at %s\n' "$install_version" "$install_target"
+    report_target_resolution
+    exit 0
+  fi
+  ((install_force == 1)) ||
+    dotfiles_die "a different or invalid chezmoi exists at $install_target; rerun with --force to replace it"
+fi
+
+case $(uname -s) in
+  Darwin) install_os=darwin ;;
+  Linux) install_os=linux ;;
+  *) dotfiles_die "unsupported operating system: $(uname -s)" ;;
+esac
+
+case $(uname -m) in
+  x86_64 | amd64) install_arch=amd64 ;;
+  arm64 | aarch64) install_arch=arm64 ;;
+  *) dotfiles_die "unsupported architecture: $(uname -m)" ;;
+esac
+
+case "$install_os/$install_arch" in
+  darwin/amd64) install_sha256=41be255eacf46b1b333591b4ddc7e90e2aa98ccb8dce47609b8284b856841652 ;;
+  darwin/arm64) install_sha256=53e576042afba703290bbc320e64d0b6bdf1082a8fb9f0d13b97e68a6e6c059f ;;
+  linux/amd64) install_sha256=0d6665b96c527d57fdc562bf19e808f80f48c2d977062c03e3e65c6b09eafbce ;;
+  linux/arm64) install_sha256=e79a27621256390f03166d3965e6a1946f983a096c4d90f02c43d2aa5b563728 ;;
+  *) dotfiles_die "unsupported platform: $install_os/$install_arch" ;;
+esac
+
+install_asset="chezmoi_${install_version}_${install_os}_${install_arch}.tar.gz"
+install_url="https://github.com/twpayne/chezmoi/releases/download/v${install_version}/${install_asset}"
+install_tmp_parent=$(dotfiles_existing_directory "${TMPDIR:-/tmp}" 'temporary directory')
+install_tmp_root=$(mktemp -d "$install_tmp_parent/dotfiles-chezmoi.XXXXXXXX")
+install_archive="$install_tmp_root/$install_asset"
+
+printf 'Downloading %s\n' "$install_url"
+download_asset "$install_url" "$install_archive"
+verify_sha256 "$install_archive" "$install_sha256"
+tar -xzf "$install_archive" -C "$install_tmp_root" chezmoi
+[[ -f $install_tmp_root/chezmoi ]] || dotfiles_die 'release archive did not contain the chezmoi binary'
+chmod 0755 "$install_tmp_root/chezmoi"
+chezmoi_is_pinned_version "$install_tmp_root/chezmoi" ||
+  dotfiles_die 'downloaded binary did not report the pinned version'
+
+install_stage=$(mktemp "$install_bin_dir/.chezmoi-install.XXXXXXXX")
+install -m 0755 "$install_tmp_root/chezmoi" "$install_stage"
+chezmoi_is_pinned_version "$install_stage" || dotfiles_die 'staged binary failed its version check'
+
+if [[ (-e $install_target || -L $install_target) && $install_force -ne 1 ]]; then
+  dotfiles_die "installation target appeared during installation: $install_target"
+fi
+if [[ -d $install_target ]]; then
+  dotfiles_die "installation target became or resolves to a directory: $install_target"
+fi
+dotfiles_atomic_replace "$install_stage" "$install_target"
+install_stage=
+
+printf 'Installed chezmoi %s at %s\n' "$install_version" "$install_target"
+report_target_resolution

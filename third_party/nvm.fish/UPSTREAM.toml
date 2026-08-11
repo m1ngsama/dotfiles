@@ -1,0 +1,16 @@
+name = "nvm.fish"
+version = "2.2.17"
+source = "https://github.com/jorgebucaran/nvm.fish"
+revision = "abd3002b6d2d578d484a5aea94dd1517dded6d42"
+license = "MIT"
+license_path = "third_party/nvm.fish/LICENSE.md"
+license_sha256 = "f101c761d255d0dddc77dd8a9327733b03d381798ec54a1bb718367207b48a8e"
+
+[files]
+"home/dot_config/fish/conf.d/nvm.fish" = "28a058e877d82c68ad0c65fa69fc392daacab66bf15539d0051e6b48b6dee8d4"
+"home/dot_config/fish/completions/nvm.fish" = "75b5b7e36083f6649fcad578798fcc6d23c189e86f19aca9bee2296e26415853"
+"home/dot_config/fish/functions/_nvm_index_update.fish" = "06df8720ead8d28bc1c39e6611e4fc8134e57d4668be460c08617f0cbf91e5b1"
+"home/dot_config/fish/functions/_nvm_list.fish" = "6773687d1ed846630d96472d8684c1fac57ca6a3c9c3c66f3aa75bed63be88c9"
+"home/dot_config/fish/functions/_nvm_version_activate.fish" = "3cff7eb9b28dad689e73b164a57ba6bf0d5f88b6d962580f8409e1779d0e8fa0"
+"home/dot_config/fish/functions/_nvm_version_deactivate.fish" = "cd9aec256fafc24e0b4eefafcc3c0bfb6725d1a6bbe5acc38f7b36d15bab7e63"
+"home/dot_config/fish/functions/nvm.fish" = "999ad75d5f9454855b008390b8a5f4536a0ae4f27a0998863c3b94a2d6c77c27"
