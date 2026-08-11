@@ -1,0 +1,105 @@
+name: check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: static (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Dependency installation shares this job, so keep infrastructure failures
+    # separate from the tighter timeout on the repository check itself.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Linux checks
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential fish i3-wm jq lua5.4 luarocks nodejs npm \
+            ripgrep shellcheck tmux unzip xz-utils
+
+      - name: Install macOS checks
+        if: runner.os == 'macOS'
+        run: brew install fish jq lua luarocks node ripgrep shellcheck tmux
+
+      - name: Install pinned Neovim
+        shell: bash
+        run: |
+          set -euo pipefail
+          nvim_version=0.12.4
+          case "$(uname -s)/$(uname -m)" in
+            Darwin/arm64)
+              nvim_asset=nvim-macos-arm64.tar.gz
+              nvim_sha256=51ab83afa66d663627c2ab1be43209b0f4e81360d4598b53efaa4d8195f24c89
+              ;;
+            Darwin/x86_64)
+              nvim_asset=nvim-macos-x86_64.tar.gz
+              nvim_sha256=03fe16f8dd9f1e9eaf52d5e294913a39917b9e2faea30d7fb0fb385fbd36fe59
+              ;;
+            Linux/aarch64 | Linux/arm64)
+              nvim_asset=nvim-linux-arm64.tar.gz
+              nvim_sha256=ceb7e88c6b681f0515d135dcdfad54f5eb4373b25ce6172197cd9a69c758063f
+              ;;
+            Linux/x86_64)
+              nvim_asset=nvim-linux-x86_64.tar.gz
+              nvim_sha256=012bf3fcac5ade43914df3f174668bf64d05e049a4f032a388c027b1ebd78628
+              ;;
+            *)
+              printf 'unsupported Neovim CI platform\n' >&2
+              exit 1
+              ;;
+          esac
+          nvim_archive="$RUNNER_TEMP/$nvim_asset"
+          curl --fail --location --silent --show-error \
+            --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 300 \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            --output "$nvim_archive" \
+            "https://github.com/neovim/neovim/releases/download/v${nvim_version}/${nvim_asset}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            nvim_actual=$(sha256sum "$nvim_archive" | awk '{print $1}')
+          else
+            nvim_actual=$(shasum -a 256 "$nvim_archive" | awk '{print $1}')
+          fi
+          [[ $nvim_actual == "$nvim_sha256" ]]
+          tar -xzf "$nvim_archive" -C "$RUNNER_TEMP"
+          nvim_root=${nvim_asset%.tar.gz}
+          printf '%s\n' "$RUNNER_TEMP/$nvim_root/bin" >> "$GITHUB_PATH"
+
+      - name: Install repository-pinned chezmoi
+        shell: bash
+        run: |
+          chezmoi_bin_dir="$RUNNER_TEMP/dotfiles-bin"
+          ./scripts/install-chezmoi --force --bin-dir "$chezmoi_bin_dir"
+          printf '%s\n' "$chezmoi_bin_dir" >> "$GITHUB_PATH"
+
+      - name: Run checks
+        timeout-minutes: ${{ github.event_name == 'pull_request' && 5 || 20 }}
+        env:
+          # Pull requests stay fast. The reviewed main state and manual runs
+          # exercise network provisioning; Linux also runs the full cold graph.
+          DOTFILES_CHECK_NETWORK: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          DOTFILES_CHECK_NVIM_FULL: ${{ runner.os == 'Linux' && github.event_name != 'pull_request' && '1' || '0' }}
+          DOTFILES_CHECK_STRICT: '1'
+        run: ./scripts/check

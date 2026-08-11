@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+active_child=
+setup_lock=
+lock_owned=0
+
+cleanup() {
+  if ((lock_owned == 1)) && [[ -n $setup_lock ]]; then
+    if [[ -f $setup_lock/pid ]] && [[ $(<"$setup_lock/pid") == "$$" ]]; then
+      rm -f -- "$setup_lock/pid"
+    fi
+    rmdir -- "$setup_lock" 2>/dev/null || true
+    lock_owned=0
+  fi
+}
+
+handle_signal() {
+  local status=$1
+  trap - HUP INT TERM
+  if [[ -n $active_child ]]; then
+    kill -TERM "$active_child" 2>/dev/null || true
+    wait "$active_child" 2>/dev/null || true
+    active_child=
+  fi
+  cleanup
+  trap - EXIT
+  exit "$status"
+}
+
+run_child() {
+  local status=0
+  "$@" &
+  active_child=$!
+  wait "$active_child" || status=$?
+  active_child=
+  return "$status"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+if ! command -v nvim >/dev/null 2>&1; then
+  printf 'Neovim is required; install the supported version first.\n' >&2
+  exit 1
+fi
+
+# These are private script locations, never caller configuration.
+unset DOTFILES_NVIM_PREFLIGHT_SCRIPT DOTFILES_NVIM_SETUP_SCRIPT
+# Repository-scoping Git variables commonly leak from bare-repository shell
+# workflows and override every `git -C` used by the plugin manager. They are
+# never meaningful for this provisioner. Config-count and template injection
+# are also process-local input channels, so do not pass them into plugin clones.
+unset \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_COMMON_DIR \
+  GIT_CONFIG \
+  GIT_CONFIG_COUNT \
+  GIT_CONFIG_PARAMETERS \
+  GIT_DIR \
+  GIT_DIFF_OPTS \
+  GIT_EXTERNAL_DIFF \
+  GIT_INDEX_FILE \
+  GIT_NAMESPACE \
+  GIT_OBJECT_DIRECTORY \
+  GIT_REPLACE_REF_BASE \
+  GIT_SHALLOW_FILE \
+  GIT_TEMPLATE_DIR \
+  GIT_WORK_TREE
+
+# Provision only the reviewed public repositories. Personal and system Git
+# configuration can otherwise inject hooks, templates, clean/smudge filters,
+# attributes, or fsmonitor commands into a brand-new checkout before the
+# preflight has a chance to inspect it. Keep standard proxy environment
+# variables available, but make Git's executable/content-changing inputs
+# explicit for both the preflight and every clone performed by Neovim.
+export GIT_ATTR_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_COUNT=3
+export GIT_CONFIG_KEY_0=core.hooksPath
+export GIT_CONFIG_VALUE_0=/dev/null
+export GIT_CONFIG_KEY_1=core.fsmonitor
+export GIT_CONFIG_VALUE_1=false
+export GIT_CONFIG_KEY_2=core.attributesFile
+export GIT_CONFIG_VALUE_2=/dev/null
+export DOTFILES_NVIM_PREFLIGHT_SCRIPT="$repo_root/scripts/nvim-preflight.lua"
+export DOTFILES_NVIM_SETUP_SCRIPT="$repo_root/scripts/nvim-first-start.lua"
+export NVIM_APPNAME=nvim
+
+# Hold one provisioner across preflight and readiness. A stale directory is
+# kept for manual inspection instead of guessing whether another process owns
+# it; remove it only after confirming no setup-nvim process is active.
+state_home=${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}
+lock_parent="$state_home/nvim"
+mkdir -p -- "$lock_parent"
+setup_lock="$lock_parent/dotfiles-setup.lock"
+if ! mkdir -- "$setup_lock" 2>/dev/null; then
+  printf 'Another Neovim setup may be active; lock exists at %s\n' "$setup_lock" >&2
+  printf 'Close other setup/Neovim processes before removing a stale lock.\n' >&2
+  exit 1
+fi
+lock_owned=1
+printf '%s\n' "$$" >"$setup_lock/pid"
+
+# This clean process cannot load plugin code. It preserves every mismatched or
+# locally modified checkout in an atomic quarantine, so the normal process can
+# install the reviewed commits without ever executing the previous graph.
+printf 'Checking the installed plugin graph against the reviewed lock.\n'
+run_child nvim --clean --headless -u NONE \
+  '+lua dofile(vim.env.DOTFILES_NVIM_PREFLIGHT_SCRIPT)' +qa
+
+printf 'Provisioning the reviewed plugin and toolchain graph.\n'
+run_child nvim --headless '+lua dofile(vim.env.DOTFILES_NVIM_SETUP_SCRIPT)'

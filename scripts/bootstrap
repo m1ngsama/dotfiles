@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -P -- "$script_dir/.." && pwd -P)
+# shellcheck disable=SC1091
+source "$script_dir/lib/safety.bash"
+
+bootstrap_apply=0
+bootstrap_force=0
+bootstrap_clean_legacy=0
+bootstrap_noninteractive=0
+bootstrap_destination=${HOME:-}
+bootstrap_destination_explicit=0
+bootstrap_linux_x11=
+bootstrap_chezmoi=
+bootstrap_backup_parent=
+bootstrap_config_exists=0
+bootstrap_tmp_root=
+bootstrap_tmp_parent=
+bootstrap_backup=
+bootstrap_transaction_active=0
+
+bootstrap_assert_destination_internal_path() {
+  local relative=$1
+  local expected_type=$2
+  local description=$3
+  local target
+
+  dotfiles_validate_relative_path "$relative"
+  dotfiles_assert_safe_parent_chain "$bootstrap_destination" "$relative"
+  target="$bootstrap_destination/$relative"
+  [[ ! -L $target ]] || dotfiles_die "refusing symlinked $description: $target"
+
+  if [[ -e $target ]]; then
+    case $expected_type in
+      directory)
+        [[ -d $target ]] || dotfiles_die "$description is not a directory: $target"
+        ;;
+      file)
+        [[ -f $target ]] || dotfiles_die "$description is not a regular file: $target"
+        ;;
+      *)
+        dotfiles_die "internal error: invalid destination path type: $expected_type"
+        ;;
+    esac
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/bootstrap [OPTIONS]
+
+By default, initialize chezmoi from this checkout and show `chezmoi diff`.
+No managed target is written unless --apply is supplied.
+
+Options:
+  --apply                 Back up existing targets, then apply interactively.
+  --force                 With --apply, overwrite after preview and backup.
+  --clean-legacy          With --apply, remove backed-up retired Fish files.
+  --linux-x11             Enable the Linux X11/i3 profile explicitly.
+  --no-linux-x11          Disable the Linux X11/i3 profile explicitly.
+  --non-interactive       Disable prompts; a new config defaults X11 off.
+  --destination DIR       Use DIR as the destination/home (isolated for CI).
+  --backup-parent DIR     Store pre-apply backups below DIR.
+  --chezmoi PATH          Use an explicit chezmoi executable.
+  -h, --help              Show this help.
+
+For a clean CI smoke test, use a freshly-created absolute --destination with
+--non-interactive --no-linux-x11 --apply.
+EOF
+}
+
+cleanup() {
+  if [[ -n $bootstrap_tmp_root && -n $bootstrap_tmp_parent ]]; then
+    dotfiles_safe_cleanup_tree "$bootstrap_tmp_root" "$bootstrap_tmp_parent" dotfiles-bootstrap.
+    bootstrap_tmp_root=
+  fi
+}
+
+exit_for_signal() {
+  local status=$1
+
+  # A second signal must not recurse into an in-progress rollback. The
+  # transaction helper marks itself inactive before invoking restore.
+  trap - HUP INT TERM
+  if ((bootstrap_transaction_active == 1)) && [[ -n $bootstrap_backup ]]; then
+    rollback_apply 'Apply interrupted by a signal'
+  fi
+  cleanup || true
+  trap - EXIT
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit_for_signal 129' HUP
+trap 'exit_for_signal 130' INT
+trap 'exit_for_signal 143' TERM
+
+while (($# > 0)); do
+  case $1 in
+    --apply)
+      bootstrap_apply=1
+      shift
+      ;;
+    --force)
+      bootstrap_force=1
+      shift
+      ;;
+    --clean-legacy)
+      bootstrap_clean_legacy=1
+      shift
+      ;;
+    --linux-x11)
+      [[ -z $bootstrap_linux_x11 ]] || dotfiles_die 'choose only one Linux X11 option'
+      bootstrap_linux_x11=true
+      shift
+      ;;
+    --no-linux-x11)
+      [[ -z $bootstrap_linux_x11 ]] || dotfiles_die 'choose only one Linux X11 option'
+      bootstrap_linux_x11=false
+      shift
+      ;;
+    --non-interactive)
+      bootstrap_noninteractive=1
+      shift
+      ;;
+    --destination)
+      (($# >= 2)) || dotfiles_die '--destination requires an argument'
+      bootstrap_destination=$2
+      bootstrap_destination_explicit=1
+      shift 2
+      ;;
+    --destination=*)
+      bootstrap_destination=${1#*=}
+      bootstrap_destination_explicit=1
+      shift
+      ;;
+    --backup-parent)
+      (($# >= 2)) || dotfiles_die '--backup-parent requires an argument'
+      bootstrap_backup_parent=$2
+      shift 2
+      ;;
+    --backup-parent=*)
+      bootstrap_backup_parent=${1#*=}
+      shift
+      ;;
+    --chezmoi)
+      (($# >= 2)) || dotfiles_die '--chezmoi requires an argument'
+      bootstrap_chezmoi=$2
+      shift 2
+      ;;
+    --chezmoi=*)
+      bootstrap_chezmoi=${1#*=}
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      dotfiles_die "unknown argument: $1"
+      ;;
+  esac
+done
+
+((bootstrap_force == 0 || bootstrap_apply == 1)) ||
+  dotfiles_die '--force requires --apply'
+((bootstrap_clean_legacy == 0 || bootstrap_apply == 1)) ||
+  dotfiles_die '--clean-legacy requires --apply'
+
+[[ -f $repo_root/.chezmoiroot ]] || dotfiles_die 'repository is missing .chezmoiroot'
+[[ $(<"$repo_root/.chezmoiroot") == home ]] || dotfiles_die '.chezmoiroot must contain home'
+[[ -d $repo_root/home ]] || dotfiles_die 'repository is missing the home source-state directory'
+bootstrap_legacy_manifest="$script_dir/legacy-fish-paths"
+[[ -f $bootstrap_legacy_manifest && ! -L $bootstrap_legacy_manifest ]] ||
+  dotfiles_die "repository is missing the regular legacy Fish manifest: $bootstrap_legacy_manifest"
+
+if [[ -z $bootstrap_chezmoi ]]; then
+  bootstrap_chezmoi=$(command -v chezmoi 2>/dev/null || true)
+fi
+[[ -n $bootstrap_chezmoi ]] ||
+  dotfiles_die 'chezmoi is not available; run scripts/install-chezmoi first'
+[[ $bootstrap_chezmoi == /* ]] || dotfiles_die "chezmoi path must be absolute: $bootstrap_chezmoi"
+[[ -x $bootstrap_chezmoi && ! -d $bootstrap_chezmoi ]] ||
+  dotfiles_die "chezmoi is not executable: $bootstrap_chezmoi"
+
+[[ -n $bootstrap_destination ]] || dotfiles_die 'HOME is unset; pass --destination explicitly'
+bootstrap_destination=$(dotfiles_prepare_directory "$bootstrap_destination" 'destination')
+if [[ -n $bootstrap_backup_parent ]]; then
+  dotfiles_validate_absolute_path "$bootstrap_backup_parent" 'backup parent'
+fi
+
+bootstrap_uname=$(uname -s)
+if [[ $bootstrap_linux_x11 == true && $bootstrap_uname != Linux ]]; then
+  dotfiles_die '--linux-x11 is supported only on Linux'
+fi
+bootstrap_tmp_parent=${TMPDIR:-/tmp}
+bootstrap_tmp_parent=$(dotfiles_existing_directory "$bootstrap_tmp_parent" 'temporary directory')
+bootstrap_tmp_root=$(mktemp -d "$bootstrap_tmp_parent/dotfiles-bootstrap.XXXXXXXX")
+bootstrap_managed_paths="$bootstrap_tmp_root/managed-paths"
+bootstrap_managed_dirs="$bootstrap_tmp_root/managed-dirs"
+bootstrap_legacy_existing="$bootstrap_tmp_root/legacy-existing"
+: >"$bootstrap_legacy_existing"
+
+cm=(
+  "$bootstrap_chezmoi"
+  --source "$repo_root"
+  --destination "$bootstrap_destination"
+)
+
+if ((bootstrap_destination_explicit == 1)); then
+  bootstrap_config_relative=.config/chezmoi/chezmoi.toml
+  bootstrap_cache_relative=.cache/chezmoi
+  bootstrap_state_relative=.local/state/chezmoi/chezmoistate.boltdb
+
+  # Validate all three destination-internal paths before creating any of their
+  # directories. This prevents mkdir and chezmoi init from following an
+  # existing parent symlink and writing outside the selected destination.
+  bootstrap_assert_destination_internal_path \
+    "$bootstrap_config_relative" file 'chezmoi config path'
+  bootstrap_assert_destination_internal_path \
+    "$bootstrap_cache_relative" directory 'chezmoi cache path'
+  bootstrap_assert_destination_internal_path \
+    "$bootstrap_state_relative" file 'chezmoi persistent state path'
+  if [[ -z $bootstrap_backup_parent ]]; then
+    # The destination-local default is trusted only after validating every
+    # existing parent and its endpoint. An explicitly supplied absolute
+    # --backup-parent remains the opt-in route to an external backup volume.
+    bootstrap_backup_relative=.local/state/dotfiles/backups
+    bootstrap_assert_destination_internal_path \
+      "$bootstrap_backup_relative" directory 'default backup path'
+  fi
+
+  bootstrap_config="$bootstrap_destination/$bootstrap_config_relative"
+  bootstrap_cache="$bootstrap_destination/$bootstrap_cache_relative"
+  bootstrap_state="$bootstrap_destination/$bootstrap_state_relative"
+  mkdir -p -- "$(dirname -- "$bootstrap_config")" "$bootstrap_cache" "$(dirname -- "$bootstrap_state")"
+  cm+=(
+    --config "$bootstrap_config"
+    --config-format toml
+    --cache "$bootstrap_cache"
+    --persistent-state "$bootstrap_state"
+  )
+else
+  bootstrap_config=$(
+    "$bootstrap_chezmoi" --destination "$bootstrap_destination" \
+      execute-template '{{ .chezmoi.configFile }}'
+  )
+fi
+
+dotfiles_validate_absolute_path "$bootstrap_config" 'chezmoi config path'
+if [[ -e $bootstrap_config || -L $bootstrap_config ]]; then
+  bootstrap_config_exists=1
+  [[ -f $bootstrap_config && ! -L $bootstrap_config ]] ||
+    dotfiles_die "existing chezmoi config must be a regular, non-symlink file: $bootstrap_config"
+  configured_source_args=(
+    "$bootstrap_chezmoi"
+    --destination "$bootstrap_destination"
+    --config "$bootstrap_config"
+  )
+  if ((bootstrap_destination_explicit == 1)); then
+    configured_source_args+=(--config-format toml)
+  fi
+  configured_source=$("${configured_source_args[@]}" execute-template '{{ .chezmoi.workingTree }}') ||
+    dotfiles_die "could not read sourceDir from existing config: $bootstrap_config"
+  if [[ -d $configured_source ]]; then
+    configured_source=$(dotfiles_existing_directory "$configured_source" 'configured sourceDir')
+  fi
+  if [[ $configured_source != "$repo_root" ]]; then
+    dotfiles_die "existing chezmoi config points to another sourceDir ($configured_source); refusing to overwrite $bootstrap_config"
+  fi
+fi
+
+# A non-interactive first initialization needs a prompt default. Once a config
+# exists, an omitted profile flag must respect its persisted machine choice.
+if [[ -z $bootstrap_linux_x11 && $bootstrap_noninteractive -eq 1 && $bootstrap_config_exists -eq 0 ]]; then
+  bootstrap_linux_x11=false
+fi
+
+if [[ -n $bootstrap_linux_x11 ]]; then
+  cm+=(--override-data "{\"profiles\":{\"linuxX11\":$bootstrap_linux_x11}}")
+fi
+if ((bootstrap_noninteractive == 1)); then
+  cm+=(--no-tty)
+fi
+
+if ((bootstrap_config_exists == 0)); then
+  printf 'Initializing chezmoi source state from %s\n' "$repo_root"
+  bootstrap_init_args=(init)
+  if [[ -n $bootstrap_linux_x11 ]]; then
+    # Config-template prompts run before --override-data is merged into the
+    # source-state data. Seed the matching init prompt explicitly, while
+    # retaining the override for all templates rendered after initialization.
+    bootstrap_init_args+=(
+      --promptBool "Enable the Linux X11/i3 profile=$bootstrap_linux_x11"
+    )
+  fi
+  "${cm[@]}" "${bootstrap_init_args[@]}"
+else
+  printf 'Using the existing same-source chezmoi config without regenerating it: %s\n' "$bootstrap_config"
+  if [[ -n $bootstrap_linux_x11 ]]; then
+    printf 'Note: the explicit X11 profile overrides this run only; edit data.profiles.linuxX11 in the existing config to persist a profile change.\n'
+  fi
+fi
+
+printf '\nPlanned target changes:\n'
+"${cm[@]}" --no-pager diff
+
+while IFS= read -r legacy_path || [[ -n $legacy_path ]]; do
+  dotfiles_validate_relative_path "$legacy_path"
+  dotfiles_assert_safe_parent_chain "$bootstrap_destination" "$legacy_path"
+  legacy_target="$bootstrap_destination/$legacy_path"
+  if [[ -e $legacy_target || -L $legacy_target ]]; then
+    [[ ! -d $legacy_target || -L $legacy_target ]] ||
+      dotfiles_die "legacy Fish path unexpectedly became a directory: $legacy_target"
+    printf '%s\n' "$legacy_path" >>"$bootstrap_legacy_existing"
+  fi
+done <"$bootstrap_legacy_manifest"
+
+if [[ -s $bootstrap_legacy_existing ]]; then
+  printf '\nDetected retired files from the pre-chezmoi Fish layout:\n'
+  sed 's/^/  /' "$bootstrap_legacy_existing"
+  if ((bootstrap_clean_legacy == 1)); then
+    printf 'These exact paths will be backed up and removed after a successful apply.\n'
+  else
+    printf 'They are not managed or removed automatically; rerun with --apply --clean-legacy after review.\n'
+  fi
+fi
+if [[ -e $bootstrap_destination/.config/fish/fish_variables ]]; then
+  printf '\nNote: .config/fish/fish_variables is mutable Fish state and is never removed automatically; inspect universal variables separately during an upgrade.\n'
+fi
+
+if ((bootstrap_apply == 0)); then
+  printf '\nPreview only; rerun with --apply to back up and write managed targets.\n'
+  exit 0
+fi
+
+"${cm[@]}" managed --format= --include=files,symlinks --path-style=relative >"$bootstrap_managed_paths"
+"${cm[@]}" managed --format= --include=dirs --path-style=relative >"$bootstrap_managed_dirs"
+if ((bootstrap_clean_legacy == 1)); then
+  while IFS= read -r legacy_path || [[ -n $legacy_path ]]; do
+    grep -Fqx -- "$legacy_path" "$bootstrap_managed_paths" ||
+      printf '%s\n' "$legacy_path" >>"$bootstrap_managed_paths"
+  done <"$bootstrap_legacy_existing"
+fi
+if [[ -z $bootstrap_backup_parent ]]; then
+  if ((bootstrap_destination_explicit == 1)); then
+    bootstrap_backup_parent="$bootstrap_destination/.local/state/dotfiles/backups"
+  else
+    bootstrap_backup_parent="${XDG_STATE_HOME:-$bootstrap_destination/.local/state}/dotfiles/backups"
+  fi
+fi
+dotfiles_validate_absolute_path "$bootstrap_backup_parent" 'backup parent'
+
+printf '\nBacking up all existing managed targets before apply.\n'
+bootstrap_backup=$(
+  "$script_dir/backup" \
+    --destination "$bootstrap_destination" \
+    --output-parent "$bootstrap_backup_parent" \
+    --directories-file "$bootstrap_managed_dirs" \
+    --paths-file "$bootstrap_managed_paths"
+)
+printf 'Backup: %s\n' "$bootstrap_backup"
+
+rollback_apply() {
+  bootstrap_transaction_active=0
+  printf '%s; restoring the pre-apply files, symlinks, and directory modes from this run.\n' "$1" >&2
+  if "$script_dir/restore" --apply --remove-created "$bootstrap_backup"; then
+    printf 'Automatic rollback completed. Newly-created directories are intentionally left in place.\n' >&2
+  else
+    printf 'Automatic rollback also failed. Preview the retained backup with:\n  %q %q\n' \
+      "$script_dir/restore" "$bootstrap_backup" >&2
+  fi
+}
+
+printf '\nApplying managed targets.\n'
+if ((bootstrap_force == 1)); then
+  bootstrap_apply_args=(--force)
+else
+  bootstrap_apply_args=(--less-interactive)
+fi
+bootstrap_transaction_active=1
+if ! "${cm[@]}" "${bootstrap_apply_args[@]}" apply; then
+  rollback_apply 'Apply failed'
+  if ((bootstrap_noninteractive == 1 && bootstrap_force == 0)); then
+    printf 'A non-interactive migration with pre-existing targets requires explicit --force after reviewing the diff and backup.\n' >&2
+  fi
+  exit 1
+fi
+
+if ! "${cm[@]}" verify; then
+  rollback_apply 'Post-apply verification failed or the interactive migration was cancelled'
+  exit 1
+fi
+
+clean_legacy_paths() (
+  # This function is deliberately called from an `if ! ...` condition, where
+  # Bash disables errexit inheritance. Check every operation that can fail so
+  # a partial cleanup can never be mistaken for a committed transaction.
+  printf '\nRemoving backed-up retired Fish paths.\n' || return 1
+  while IFS= read -r legacy_path || [[ -n $legacy_path ]]; do
+    dotfiles_assert_safe_parent_chain "$bootstrap_destination" "$legacy_path" || return 1
+    legacy_target="$bootstrap_destination/$legacy_path"
+    if [[ -d $legacy_target && ! -L $legacy_target ]]; then
+      printf 'error: refusing to remove a legacy path that became a directory: %s\n' \
+        "$legacy_target" >&2 || return 1
+      return 1
+    fi
+    rm -f -- "$legacy_target" || return 1
+    printf 'removed %s\n' "$legacy_path" || return 1
+  done <"$bootstrap_legacy_existing"
+)
+
+if ((bootstrap_clean_legacy == 1)) && [[ -s $bootstrap_legacy_existing ]]; then
+  if ! clean_legacy_paths; then
+    rollback_apply 'Retired Fish cleanup failed'
+    exit 1
+  fi
+fi
+bootstrap_transaction_active=0
+printf 'Apply and verification completed successfully.\n'

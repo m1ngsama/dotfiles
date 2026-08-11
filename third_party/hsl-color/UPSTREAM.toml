@@ -1,0 +1,20 @@
+name = "columns color.lua"
+source = "https://github.com/EmmanuelOga/columns"
+revision = "836312be76b85b7f85e0cb2c31f5f22624c62d3e"
+upstream_path = "utils/color.lua"
+upstream_sha256 = "46497e998a8fba66d2b35f0faaef947069c58ce1692698cb43fb255af026e7b1"
+license = "CC-BY-3.0"
+license_path = "third_party/hsl-color/LICENSE"
+license_sha256 = "2a97b6c436d78be028a88a0d4fa39fa10e8aa96686d1055c1303ea51fb71bbd3"
+attribution = "RGB/HSL conversion math by Emmanuel Oga, adapted for this Neovim configuration."
+
+modifications = [
+  "Kept the RGB/HSL conversion math and integrated it into a Neovim line action.",
+  "Added explicit 3- and 6-digit hexadecimal validation and short-form expansion.",
+  "Rejected unsupported hexadecimal lengths instead of truncating them.",
+  "Made helper functions local, rounded RGB bytes safely, and added pure-Lua regression tests.",
+]
+
+[deployed]
+path = "home/dot_config/nvim/lua/m1ngsama/hsl.lua"
+sha256 = "0a446c0074bec8c935e0d7203cba420c1b88a0ca02364ba943e1c8e54b94f49b"

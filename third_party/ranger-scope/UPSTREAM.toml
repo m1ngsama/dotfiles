@@ -1,0 +1,24 @@
+name = "ranger scope.sh"
+version = "1.9.4"
+source = "https://github.com/ranger/ranger"
+revision = "55fc2839f693aed9486d211694d7317d78161341"
+upstream_path = "ranger/data/scope.sh"
+upstream_sha256 = "141bf1d096d0e94367f566ac05578b49248c60af6bb537c60b492f5db3b58408"
+license = "GPL-3.0-only"
+license_path = "third_party/ranger-scope/LICENSE"
+license_sha256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+security_reference = "https://github.com/ranger/ranger/issues/3231"
+
+modifications = [
+  "Reformatted with the repository shell style.",
+  "Added GNU/BSD stat compatibility for text preview size checks.",
+  "Added application/javascript to the text MIME preview branch.",
+  "Replaced the predictable /tmp font preview path (CWE-377) with a private mktemp directory and trap cleanup.",
+  "Enabled guarded ffmpegthumbnailer video thumbnails and Poppler PDF image previews.",
+  "Added guarded chafa previews for images and generated video or PDF thumbnails when graphical previews are disabled.",
+  "Guarded optional media metadata, conversion, and font commands and fall back to file classification when they are unavailable.",
+]
+
+[deployed]
+path = "home/dot_config/ranger/executable_scope.sh"
+sha256 = "6ceec6d6db3309c6cd98832824c3d9d8f983d94e14beb8475fd93e9a5ca76a81"

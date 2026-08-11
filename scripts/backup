@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck disable=SC1091
+source "$script_dir/lib/safety.bash"
+
+backup_destination=${HOME:-}
+backup_paths_file=
+backup_directories_file=
+backup_output_parent=
+backup_dir=
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/backup --paths-file FILE [--directories-file FILE]
+                      [--destination DIR] [--output-parent DIR]
+
+Back up the existing regular files and symlinks named in FILE. FILE must
+contain one validated destination-relative path per line. The resulting
+manifest also records paths that did not exist, enabling an explicit restore
+to distinguish pre-existing files from files later created by chezmoi.
+--directories-file records whether managed directories existed and preserves
+their permission mode without copying their contents.
+EOF
+}
+
+cleanup_failed_backup() {
+  if [[ -n $backup_dir && -n $backup_output_parent ]]; then
+    dotfiles_safe_cleanup_tree "$backup_dir" "$backup_output_parent" backup-
+    backup_dir=
+  fi
+}
+
+exit_for_signal() {
+  local status=$1
+
+  trap - HUP INT TERM
+  cleanup_failed_backup || true
+  trap - EXIT
+  exit "$status"
+}
+
+trap cleanup_failed_backup EXIT
+trap 'exit_for_signal 129' HUP
+trap 'exit_for_signal 130' INT
+trap 'exit_for_signal 143' TERM
+
+while (($# > 0)); do
+  case $1 in
+    --destination)
+      (($# >= 2)) || dotfiles_die '--destination requires an argument'
+      backup_destination=$2
+      shift 2
+      ;;
+    --destination=*)
+      backup_destination=${1#*=}
+      shift
+      ;;
+    --paths-file)
+      (($# >= 2)) || dotfiles_die '--paths-file requires an argument'
+      backup_paths_file=$2
+      shift 2
+      ;;
+    --paths-file=*)
+      backup_paths_file=${1#*=}
+      shift
+      ;;
+    --directories-file)
+      (($# >= 2)) || dotfiles_die '--directories-file requires an argument'
+      backup_directories_file=$2
+      shift 2
+      ;;
+    --directories-file=*)
+      backup_directories_file=${1#*=}
+      shift
+      ;;
+    --output-parent)
+      (($# >= 2)) || dotfiles_die '--output-parent requires an argument'
+      backup_output_parent=$2
+      shift 2
+      ;;
+    --output-parent=*)
+      backup_output_parent=${1#*=}
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      dotfiles_die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n $backup_destination ]] || dotfiles_die 'HOME is unset; pass --destination explicitly'
+[[ -n $backup_paths_file ]] || dotfiles_die '--paths-file is required'
+dotfiles_validate_absolute_path "$backup_paths_file" 'paths file'
+[[ -f $backup_paths_file && ! -L $backup_paths_file ]] ||
+  dotfiles_die "paths file must be a regular, non-symlink file: $backup_paths_file"
+if [[ -n $backup_directories_file ]]; then
+  dotfiles_validate_absolute_path "$backup_directories_file" 'directories file'
+  [[ -f $backup_directories_file && ! -L $backup_directories_file ]] ||
+    dotfiles_die "directories file must be a regular, non-symlink file: $backup_directories_file"
+fi
+
+backup_destination=$(dotfiles_prepare_directory "$backup_destination" 'destination')
+if [[ -z $backup_output_parent ]]; then
+  backup_output_parent="$backup_destination/.local/state/dotfiles/backups"
+fi
+backup_output_parent=$(dotfiles_prepare_directory "$backup_output_parent" 'backup parent')
+
+duplicate_path=$(LC_ALL=C sort "$backup_paths_file" | uniq -d | head -n 1 || true)
+[[ -z $duplicate_path ]] || dotfiles_die "duplicate managed path: $duplicate_path"
+if [[ -n $backup_directories_file ]]; then
+  duplicate_path=$(LC_ALL=C sort "$backup_directories_file" | uniq -d | head -n 1 || true)
+  [[ -z $duplicate_path ]] || dotfiles_die "duplicate managed directory: $duplicate_path"
+fi
+
+backup_timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup_dir=$(mktemp -d "$backup_output_parent/backup-$backup_timestamp.XXXXXXXX")
+mkdir -p -- "$backup_dir/files"
+backup_manifest="$backup_dir/manifest.tsv"
+backup_metadata="$backup_dir/metadata"
+: >"$backup_manifest"
+{
+  printf 'format=2\n'
+  printf 'destination=%s\n' "$backup_destination"
+  printf 'created_utc=%s\n' "$backup_timestamp"
+} >"$backup_metadata"
+
+backup_count=0
+absent_count=0
+directory_count=0
+absent_directory_count=0
+while IFS= read -r managed_path || [[ -n $managed_path ]]; do
+  dotfiles_validate_relative_path "$managed_path"
+  dotfiles_assert_safe_parent_chain "$backup_destination" "$managed_path"
+  destination_target="$backup_destination/$managed_path"
+
+  if [[ -e $destination_target || -L $destination_target ]]; then
+    if [[ ! -f $destination_target && ! -L $destination_target ]]; then
+      dotfiles_die "managed file target has an unsupported type: $destination_target"
+    fi
+    backup_target="$backup_dir/files/$managed_path"
+    mkdir -p -- "$(dirname -- "$backup_target")"
+    cp -pPR -- "$destination_target" "$backup_target"
+    printf 'present\t%s\n' "$managed_path" >>"$backup_manifest"
+    backup_count=$((backup_count + 1))
+  else
+    printf 'absent\t%s\n' "$managed_path" >>"$backup_manifest"
+    absent_count=$((absent_count + 1))
+  fi
+done <"$backup_paths_file"
+
+if [[ -n $backup_directories_file ]]; then
+  while IFS= read -r managed_path || [[ -n $managed_path ]]; do
+    dotfiles_validate_relative_path "$managed_path"
+    dotfiles_assert_safe_parent_chain "$backup_destination" "$managed_path"
+    destination_target="$backup_destination/$managed_path"
+
+    if [[ -L $destination_target ]]; then
+      dotfiles_die "managed directory target is a symlink; refusing to traverse it: $destination_target"
+    elif [[ -e $destination_target ]]; then
+      [[ -d $destination_target ]] ||
+        dotfiles_die "managed directory target has an unsupported type: $destination_target"
+      if directory_mode=$(stat -c '%a' -- "$destination_target" 2>/dev/null); then
+        :
+      elif directory_mode=$(stat -f '%Lp' -- "$destination_target" 2>/dev/null); then
+        :
+      else
+        dotfiles_die "could not read directory mode: $destination_target"
+      fi
+      [[ $directory_mode =~ ^[0-7]{3,4}$ ]] ||
+        dotfiles_die "invalid directory mode for $destination_target: $directory_mode"
+      printf 'directory\t%s\t%s\n' "$managed_path" "$directory_mode" >>"$backup_manifest"
+      directory_count=$((directory_count + 1))
+    else
+      printf 'absent-directory\t%s\n' "$managed_path" >>"$backup_manifest"
+      absent_directory_count=$((absent_directory_count + 1))
+    fi
+  done <"$backup_directories_file"
+fi
+
+printf 'Backed up %d existing file/symlink target(s) and %d directory mode(s); recorded %d absent file/symlink target(s) and %d absent directories.\n' \
+  "$backup_count" "$directory_count" "$absent_count" "$absent_directory_count" >&2
+printf '%s\n' "$backup_dir"
+backup_dir=

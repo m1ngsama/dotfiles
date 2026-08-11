@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck disable=SC1091
+source "$script_dir/lib/safety.bash"
+
+restore_apply=0
+restore_remove_created=0
+restore_destination=
+restore_backup_dir=
+restore_stage=
+restore_stage_parent=
+restore_directory_paths=()
+restore_directory_modes=()
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/restore [--destination DIR] [--apply] [--remove-created] BACKUP
+
+Preview or restore a backup created by scripts/backup. The default is a
+read-only preview. --apply restores pre-existing regular files, symlinks, and
+recorded directory permission modes.
+--remove-created additionally removes regular files/symlinks that the backup
+recorded as absent; it never removes directories and requires --apply.
+EOF
+}
+
+cleanup_stage() {
+  if [[ -n $restore_stage && -n $restore_stage_parent ]]; then
+    case "$restore_stage" in
+      "$restore_stage_parent"/.dotfiles-restore.*)
+        [[ -L $restore_stage || ! -d $restore_stage ]] && rm -f -- "$restore_stage"
+        ;;
+    esac
+    restore_stage=
+    restore_stage_parent=
+  fi
+}
+
+exit_for_signal() {
+  local status=$1
+
+  trap - HUP INT TERM
+  cleanup_stage || true
+  trap - EXIT
+  exit "$status"
+}
+
+trap cleanup_stage EXIT
+trap 'exit_for_signal 129' HUP
+trap 'exit_for_signal 130' INT
+trap 'exit_for_signal 143' TERM
+
+while (($# > 0)); do
+  case $1 in
+    --apply)
+      restore_apply=1
+      shift
+      ;;
+    --remove-created)
+      restore_remove_created=1
+      shift
+      ;;
+    --destination)
+      (($# >= 2)) || dotfiles_die '--destination requires an argument'
+      restore_destination=$2
+      shift 2
+      ;;
+    --destination=*)
+      restore_destination=${1#*=}
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      dotfiles_die "unknown argument: $1"
+      ;;
+    *)
+      [[ -z $restore_backup_dir ]] || dotfiles_die 'only one backup directory may be specified'
+      restore_backup_dir=$1
+      shift
+      ;;
+  esac
+done
+
+if (($# > 0)); then
+  [[ -z $restore_backup_dir && $# -eq 1 ]] || dotfiles_die 'only one backup directory may be specified'
+  restore_backup_dir=$1
+fi
+
+[[ -n $restore_backup_dir ]] || dotfiles_die 'a backup directory is required'
+((restore_remove_created == 0 || restore_apply == 1)) ||
+  dotfiles_die '--remove-created requires --apply'
+
+restore_backup_dir=$(dotfiles_existing_directory "$restore_backup_dir" 'backup directory')
+restore_manifest="$restore_backup_dir/manifest.tsv"
+restore_metadata="$restore_backup_dir/metadata"
+[[ -f $restore_manifest && ! -L $restore_manifest ]] ||
+  dotfiles_die "missing regular manifest: $restore_manifest"
+[[ -f $restore_metadata && ! -L $restore_metadata ]] ||
+  dotfiles_die "missing regular metadata: $restore_metadata"
+
+recorded_format=
+recorded_destination=
+while IFS='=' read -r metadata_key metadata_value; do
+  case $metadata_key in
+    format) recorded_format=$metadata_value ;;
+    destination) recorded_destination=$metadata_value ;;
+  esac
+done <"$restore_metadata"
+[[ $recorded_format == 1 || $recorded_format == 2 ]] ||
+  dotfiles_die "unsupported backup format: $recorded_format"
+
+if [[ -z $restore_destination ]]; then
+  restore_destination=$recorded_destination
+fi
+[[ -n $restore_destination ]] || dotfiles_die 'backup does not record a destination; pass --destination'
+restore_destination=$(dotfiles_existing_directory "$restore_destination" 'restore destination')
+
+if [[ -n $recorded_destination && $restore_destination != "$recorded_destination" ]]; then
+  printf 'warning: restoring to %s instead of recorded destination %s\n' \
+    "$restore_destination" "$recorded_destination" >&2
+fi
+
+restore_count=0
+restore_directory_count=0
+remove_count=0
+leave_count=0
+leave_directory_count=0
+while IFS=$'\t' read -r record_state managed_path manifest_extra || [[ -n $record_state ]]; do
+  dotfiles_validate_relative_path "$managed_path"
+  dotfiles_assert_safe_parent_chain "$restore_destination" "$managed_path"
+  restore_target="$restore_destination/$managed_path"
+
+  case $record_state in
+    present)
+      [[ -z ${manifest_extra:-} ]] || dotfiles_die 'present manifest record contains an extra field'
+      restore_source="$restore_backup_dir/files/$managed_path"
+      dotfiles_assert_safe_parent_chain "$restore_backup_dir/files" "$managed_path"
+      if [[ ! -f $restore_source && ! -L $restore_source ]]; then
+        dotfiles_die "backup payload is missing or unsupported: $restore_source"
+      fi
+      printf '%s restore %s\n' "$([[ $restore_apply == 1 ]] && printf apply || printf plan)" "$managed_path"
+      if ((restore_apply == 1)); then
+        restore_stage_parent=$(dirname -- "$restore_target")
+        mkdir -p -- "$restore_stage_parent"
+        dotfiles_assert_safe_parent_chain "$restore_destination" "$managed_path"
+        if [[ -d $restore_target && ! -L $restore_target ]]; then
+          dotfiles_die "refusing to replace a real directory target: $restore_target"
+        fi
+        restore_stage=$(mktemp "$restore_stage_parent/.dotfiles-restore.XXXXXXXX")
+        rm -f -- "$restore_stage"
+        cp -pPR -- "$restore_source" "$restore_stage"
+        if [[ -d $restore_target && ! -L $restore_target ]]; then
+          dotfiles_die "restore target became a real directory: $restore_target"
+        fi
+        dotfiles_atomic_replace "$restore_stage" "$restore_target"
+        restore_stage=
+        restore_stage_parent=
+      fi
+      restore_count=$((restore_count + 1))
+      ;;
+    absent)
+      [[ -z ${manifest_extra:-} ]] || dotfiles_die 'absent manifest record contains an extra field'
+      if ((restore_remove_created == 1)); then
+        printf '%s remove-created %s\n' "$([[ $restore_apply == 1 ]] && printf apply || printf plan)" "$managed_path"
+        if [[ -e $restore_target || -L $restore_target ]]; then
+          if [[ -d $restore_target && ! -L $restore_target ]]; then
+            dotfiles_die "refusing to remove a directory: $restore_target"
+          fi
+          rm -f -- "$restore_target"
+          remove_count=$((remove_count + 1))
+        fi
+      else
+        printf 'plan leave-created %s\n' "$managed_path"
+        leave_count=$((leave_count + 1))
+      fi
+      ;;
+    directory)
+      [[ $recorded_format == 2 ]] || dotfiles_die 'directory record requires backup format 2'
+      [[ ${manifest_extra:-} =~ ^[0-7]{3,4}$ ]] ||
+        dotfiles_die "invalid recorded directory mode for $managed_path: ${manifest_extra:-}"
+      printf '%s restore-directory-mode %s %s\n' \
+        "$([[ $restore_apply == 1 ]] && printf apply || printf plan)" \
+        "$managed_path" "$manifest_extra"
+      restore_directory_paths+=("$managed_path")
+      restore_directory_modes+=("$manifest_extra")
+      restore_directory_count=$((restore_directory_count + 1))
+      ;;
+    absent-directory)
+      [[ $recorded_format == 2 ]] || dotfiles_die 'absent-directory record requires backup format 2'
+      [[ -z ${manifest_extra:-} ]] || dotfiles_die 'absent-directory record contains an extra field'
+      printf 'plan leave-created-directory %s\n' "$managed_path"
+      leave_directory_count=$((leave_directory_count + 1))
+      ;;
+    *)
+      dotfiles_die "invalid manifest state: $record_state"
+      ;;
+  esac
+done <"$restore_manifest"
+
+if ((restore_apply == 1)); then
+  # Files are restored first. Apply directory modes from deepest to shallowest
+  # so a restrictive parent never blocks restoration below it.
+  for ((index = ${#restore_directory_paths[@]} - 1; index >= 0; index--)); do
+    managed_path=${restore_directory_paths[$index]}
+    directory_mode=${restore_directory_modes[$index]}
+    dotfiles_assert_safe_parent_chain "$restore_destination" "$managed_path"
+    restore_target="$restore_destination/$managed_path"
+    [[ -d $restore_target && ! -L $restore_target ]] ||
+      dotfiles_die "recorded directory is missing or no longer a directory: $restore_target"
+    chmod "$directory_mode" "$restore_target"
+  done
+fi
+
+if ((restore_apply == 1)); then
+  printf 'Restored %d file/symlink target(s) and %d directory mode(s); removed %d newly-created target(s).\n' \
+    "$restore_count" "$restore_directory_count" "$remove_count" >&2
+else
+  printf 'Previewed %d file/symlink restore(s) and %d directory mode restore(s); %d newly-created target(s) and %d directories would remain.\n' \
+    "$restore_count" "$restore_directory_count" "$leave_count" "$leave_directory_count" >&2
+fi

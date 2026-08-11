@@ -1,1 +1,0 @@
-xmodmap -e 'clear lock' -e 'keycode 66 = Control_L' -e 'add control = Control_L'

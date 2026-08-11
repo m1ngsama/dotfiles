@@ -1,0 +1,14 @@
+# Operating-system and editor state
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Fish universal variables are mutable, machine-local state.
+home/dot_config/fish/fish_variables
+home/dot_config/fish/fish_variables.*
+
+# Application caches and generated runtime data must not enter the source tree.
+home/dot_config/nvim/.luarc.json
+home/dot_config/tmux/plugins/
