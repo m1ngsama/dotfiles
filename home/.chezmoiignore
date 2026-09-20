@@ -24,3 +24,9 @@
 .config/picom
 .config/picom/**
 {{- end }}
+
+{{- /* A GUI terminal needs a display; a headless Linux host has none. */}}
+{{- if and (eq .chezmoi.os "linux") (not $linuxX11) }}
+.config/alacritty
+.config/alacritty/**
+{{- end }}
