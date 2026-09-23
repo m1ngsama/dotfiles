@@ -1,0 +1,21 @@
+set use_preview_script true
+set preview_script ~/.config/ranger/scope.sh
+set vcs_aware true
+set column_ratios 1,2,10
+set collapse_preview false
+set wrap_plaintext_previews true
+set draw_borders separators
+set display_size_in_main_column false
+{{- if eq .chezmoi.os "darwin" }}
+set preview_images true
+set preview_images_method iterm2
+set iterm2_font_width 24
+set iterm2_font_height 48
+{{- else }}
+set preview_images false
+{{- end }}
+{{- if stat (joinPath .chezmoi.homeDir ".config/ranger/plugins/ranger_devicons") }}
+default_linemode devicons
+{{- end }}
+
+map uT shell -w trash-restore
