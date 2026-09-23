@@ -6,7 +6,7 @@ return {
 	{
 		"mason-org/mason.nvim",
 		opts = {
-			ensure_installed = { "stylua", "luacheck", "shellcheck", "shfmt", not linux_arm64 and "selene" or nil },
+			ensure_installed = { "luacheck", "shellcheck", not linux_arm64 and "selene" or nil },
 		},
 	},
 	{
