@@ -1,5 +1,4 @@
 return {
-	-- messages, cmdline and the popupmenu
 	{
 		"folke/noice.nvim",
 		opts = function(_, opts)
@@ -33,7 +32,6 @@ return {
 
 			opts.commands = {
 				all = {
-					-- options for the message history that you get with `:Noice`
 					view = "split",
 					opts = { enter = true, format = "details" },
 					filter = {},
@@ -68,7 +66,6 @@ return {
 		keys = {},
 	},
 
-	-- buffer line
 	{
 		"akinsho/bufferline.nvim",
 		event = "VeryLazy",
@@ -85,7 +82,6 @@ return {
 		},
 	},
 
-	-- filename
 	{
 		"b0o/incline.nvim",
 		dependencies = { "craftzdog/solarized-osaka.nvim" },
@@ -117,7 +113,6 @@ return {
 		end,
 	},
 
-	-- statusline
 	{
 		"nvim-lualine/lualine.nvim",
 		opts = function(_, opts)
@@ -150,6 +145,11 @@ return {
 	},
 
 	{
+		"MeanderingProgrammer/render-markdown.nvim",
+		enabled = false,
+	},
+
+	{
 		"folke/snacks.nvim",
 		opts = {
 			dashboard = {
@@ -161,7 +161,7 @@ return {
 	██║╚██╔╝██║ ██║██║╚██╗██║██║   ██║╚════██║██╔══██║██║╚██╔╝██║██╔══██║
 	██║ ╚═╝ ██║ ██║██║ ╚████║╚██████╔╝███████║██║  ██║██║ ╚═╝ ██║██║  ██║
 	╚═╝     ╚═╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝
-   ]],
+	]],
 				},
 			},
 		},

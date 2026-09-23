@@ -1,45 +1,10 @@
 return {
-	-- Create annotations with one keybind, and jump your cursor in the inserted annotation
-	{
-		"danymat/neogen",
-		keys = {
-			{
-				"<leader>cc",
-				function()
-					require("neogen").generate({})
-				end,
-				desc = "Neogen Comment",
-			},
-		},
-		opts = { snippet_engine = "luasnip" },
-	},
-
-	-- Incremental rename
 	{
 		"smjonas/inc-rename.nvim",
 		cmd = "IncRename",
 		config = true,
 	},
 
-	-- Refactoring tool
-	{
-		"ThePrimeagen/refactoring.nvim",
-		keys = {
-			{
-				"<leader>r",
-				function()
-					require("refactoring").select_refactor()
-				end,
-				mode = "v",
-				noremap = true,
-				silent = true,
-				expr = false,
-			},
-		},
-		opts = {},
-	},
-
-	-- Go forward/backward with square brackets
 	{
 		"nvim-mini/mini.bracketed",
 		event = "BufReadPost",
@@ -55,7 +20,6 @@ return {
 		end,
 	},
 
-	-- Better increase/descrease
 	{
 		"monaqa/dial.nvim",
     -- stylua: ignore
@@ -78,16 +42,24 @@ return {
 		end,
 	},
 
-	-- Use aerial.nvim instead of symbols-outline (more actively maintained)
 	{
-		"stevearc/aerial.nvim",
-		keys = { { "<leader>cs", "<cmd>AerialToggle<cr>", desc = "Symbols Outline (Aerial)" } },
-		cmd = "AerialToggle",
+		"zbirenbaum/copilot.lua",
 		opts = {
-			layout = {
-				default_direction = "right",
+			suggestion = {
+				auto_trigger = true,
+				keymap = {
+					accept = "<C-l>",
+					accept_word = "<M-l>",
+					accept_line = "<M-S-l>",
+					next = "<M-]>",
+					prev = "<M-[>",
+					dismiss = "<C-]>",
+				},
 			},
-			attach_mode = "global",
+			filetypes = {
+				markdown = true,
+				help = true,
+			},
 		},
 	},
 }

@@ -21,19 +21,36 @@ require("lazy").setup({
 			import = "lazyvim.plugins",
 			opts = {
 				colorscheme = "solarized-osaka",
-				news = { lazyvim = true, neovim = true },
+				news = {
+					lazyvim = true,
+					neovim = true,
+				},
 			},
 		},
+		{ import = "lazyvim.plugins.extras.linting.eslint" },
+		{ import = "lazyvim.plugins.extras.formatting.prettier" },
+		{ import = "lazyvim.plugins.extras.lang.typescript" },
+		{ import = "lazyvim.plugins.extras.lang.json" },
+		{ import = "lazyvim.plugins.extras.lang.rust" },
+		{ import = "lazyvim.plugins.extras.lang.tailwind" },
+		{ import = "lazyvim.plugins.extras.util.mini-hipatterns" },
 		{ import = "plugins" },
 	},
-	defaults = { lazy = false, version = false },
-	dev = { path = "~/.ghq/github.com" },
-	checker = { enabled = false },
+	defaults = {
+		lazy = false,
+		version = false,
+	},
+	dev = {
+		path = "~/.ghq/github.com",
+	},
+	checker = { enabled = true },
 	performance = {
+		cache = {
+			enabled = true,
+		},
 		rtp = {
 			disabled_plugins = {
 				"gzip",
-				"matchparen",
 				"netrwPlugin",
 				"rplugin",
 				"tarPlugin",
@@ -50,4 +67,5 @@ require("lazy").setup({
 			end,
 		},
 	},
+	debug = false,
 })
