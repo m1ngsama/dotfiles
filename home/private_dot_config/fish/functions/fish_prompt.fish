@@ -1,62 +1,90 @@
-function fish_prompt --description 'M1NGSAMA prompt'
-    set -l last_status $status
-    set -l osaka_red db302d
-    set -l osaka_magenta d23681
-    set -l osaka_blue 268bd3
-    set -l osaka_cyan 29a298
-    set -l osaka_green 849900
-    set -l osaka_yellow b28500
+function fish_prompt
+    set -l __last_command_exit_status $status
 
-    set -l marker_color $osaka_green
-    if test $last_status -ne 0
-        set marker_color $osaka_red
-        set_color --bold $osaka_red
-        printf '!%d ' $last_status
+    if not set -q -g __fish_arrow_functions_defined
+        set -g __fish_arrow_functions_defined
+        function _git_branch_name
+            set -l branch (git symbolic-ref --quiet HEAD 2>/dev/null)
+            if set -q branch[1]
+                echo (string replace -r '^refs/heads/' '' $branch)
+            else
+                echo (git rev-parse --short HEAD 2>/dev/null)
+            end
+        end
+
+        function _is_git_dirty
+            not command git diff-index --cached --quiet HEAD -- &>/dev/null
+            or not command git diff --no-ext-diff --quiet --exit-code &>/dev/null
+        end
+
+        function _is_git_repo
+            type -q git
+            or return 1
+            git rev-parse --git-dir >/dev/null 2>&1
+        end
+
+        function _hg_branch_name
+            echo (hg branch 2>/dev/null)
+        end
+
+        function _is_hg_dirty
+            set -l stat (hg status -mard 2>/dev/null)
+            test -n "$stat"
+        end
+
+        function _is_hg_repo
+            fish_print_hg_root >/dev/null
+        end
+
+        function _repo_branch_name
+            _$argv[1]_branch_name
+        end
+
+        function _is_repo_dirty
+            _is_$argv[1]_dirty
+        end
+
+        function _repo_type
+            if _is_hg_repo
+                echo hg
+                return 0
+            else if _is_git_repo
+                echo git
+                return 0
+            end
+            return 1
+        end
     end
 
-    set_color --bold $marker_color
+    set -l cyan (set_color -o cyan)
+    set -l yellow (set_color -o yellow)
+    set -l red (set_color -o red)
+    set -l green (set_color -o green)
+    set -l blue (set_color -o blue)
+    set -l normal (set_color normal)
+
+    set -l arrow_color "$green"
+    if test $__last_command_exit_status != 0
+        set arrow_color "$red"
+    end
+
+    set -l arrow "$arrow_color➜ "
     if fish_is_root_user
-        printf '# '
-    else
-        printf '➜ '
+        set arrow "$arrow_color# "
     end
 
-    set_color --bold $osaka_cyan
-    printf '%s' (prompt_pwd)
+    set -l cwd $cyan(prompt_pwd | path basename)
 
-    if command -q git
-        set -l git_status (command git --no-optional-locks status \
-            --porcelain=v2 --branch \
-            --ignore-submodules=dirty --untracked-files=no \
-            2>/dev/null)
-        if test $status -ne 0
-            set git_status
-        end
+    set -l repo_info
+    if set -l repo_type (_repo_type)
+        set -l repo_branch $red(_repo_branch_name $repo_type)
+        set repo_info "$blue $repo_type:($repo_branch$blue)"
 
-        set -l branch_line (string match -- '# branch.head *' $git_status)
-        set -l branch (string replace -- '# branch.head ' '' $branch_line)
-        if test "$branch" = '(detached)'
-            set -l oid_line (string match -- '# branch.oid *' $git_status)
-            set -l oid (string replace -- '# branch.oid ' '' $oid_line)
-            set branch (string sub --length 7 -- "$oid")
-        end
-
-        if test -n "$branch"
-            set_color --bold $osaka_blue
-            printf ' git:('
-            set_color --bold $osaka_magenta
-            printf '%s' "$branch"
-            set_color --bold $osaka_blue
-            printf ')'
-        end
-
-        set -l changes (string match --invert --regex '^# ' $git_status)
-        if test -n "$changes"
-            set_color --bold $osaka_yellow
-            printf ' *'
+        if _is_repo_dirty $repo_type
+            set -l dirty "$yellow ✗"
+            set repo_info "$repo_info$dirty"
         end
     end
 
-    set_color normal
-    printf ' '
+    echo -n -s $arrow ' '$cwd $repo_info $normal ' '
 end
