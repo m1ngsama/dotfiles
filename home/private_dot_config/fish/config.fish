@@ -1,6 +1,8 @@
 fish_add_path --global \
     "$HOME/.local/bin" \
     "$HOME/go/bin" \
+    "$HOME/.cargo/bin" \
+    "$HOME/.bun/bin" \
     /opt/homebrew/bin \
     /opt/homebrew/sbin \
     /usr/local/bin \
