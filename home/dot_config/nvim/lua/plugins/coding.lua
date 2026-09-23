@@ -90,13 +90,4 @@ return {
 			attach_mode = "global",
 		},
 	},
-
-	-- Disabled: using blink.cmp instead
-	-- {
-	-- 	"nvim-cmp",
-	-- 	dependencies = { "hrsh7th/cmp-emoji" },
-	-- 	opts = function(_, opts)
-	-- 		table.insert(opts.sources, { name = "emoji" })
-	-- 	end,
-	-- },
 }

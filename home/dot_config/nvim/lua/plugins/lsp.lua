@@ -1,58 +1,18 @@
-local function extend_unique(target, additions)
-	local seen = {}
-	for _, item in ipairs(target) do
-		seen[item] = true
-	end
-	for _, item in ipairs(additions) do
-		if not seen[item] then
-			table.insert(target, item)
-			seen[item] = true
-		end
-	end
-end
-
 local uname = vim.uv.os_uname()
+-- Mason has no Linux arm64 builds of selene or clangd.
 local linux_arm64 = uname.sysname == "Linux" and (uname.machine == "aarch64" or uname.machine == "arm64")
 
 return {
-	-- tools
 	{
 		"mason-org/mason.nvim",
-		opts = function(_, opts)
-			-- Pin the registry release as well as the mason.nvim plugin. This fixes
-			-- package recipes and source versions for reproducible cold installs.
-			opts.registries = {
-				"github:mason-org/mason-registry@2026-08-10-faulty-close",
-			}
-			if vim.g.dotfiles_benchmark == 1 then
-				opts.ensure_installed = {}
-				return
-			end
-			opts.ensure_installed = opts.ensure_installed or {}
-			local tools = {
-				"stylua",
-				"luacheck",
-				"shellcheck",
-				"shfmt",
-			}
-			-- This pinned registry release has no Linux arm64 assets for selene or
-			-- clangd. Keep provisioning successful there: luacheck remains
-			-- available and clangd is supplied by the system package manager.
-			if not linux_arm64 then
-				table.insert(tools, "selene")
-			end
-			extend_unique(opts.ensure_installed, tools)
-		end,
+		opts = {
+			ensure_installed = { "stylua", "luacheck", "shellcheck", "shfmt", not linux_arm64 and "selene" or nil },
+		},
 	},
 	{
 		"mfussenegger/nvim-lint",
-		opts = function(_, opts)
-			opts.linters_by_ft = opts.linters_by_ft or {}
-			opts.linters_by_ft.lua = { linux_arm64 and "luacheck" or "selene" }
-		end,
+		opts = { linters_by_ft = { lua = { linux_arm64 and "luacheck" or "selene" } } },
 	},
-
-	-- lsp servers
 	{
 		"neovim/nvim-lspconfig",
 		opts = {
@@ -104,7 +64,6 @@ return {
 					},
 				},
 				lua_ls = {
-					-- enabled = false,
 					single_file_support = true,
 					settings = {
 						Lua = {
@@ -117,7 +76,6 @@ return {
 							},
 							misc = {
 								parameters = {
-									-- "--log-level=trace",
 								},
 							},
 							hint = {
@@ -136,7 +94,6 @@ return {
 							},
 							diagnostics = {
 								disable = { "incomplete-signature-doc", "trailing-space" },
-								-- enable = false,
 								groupSeverity = {
 									strong = "Warning",
 									strict = "Warning",
@@ -203,7 +160,6 @@ return {
 				{
 					"gd",
 					function()
-						-- DO NOT RESUSE WINDOW
 						require("telescope.builtin").lsp_definitions({ reuse_win = false })
 					end,
 					desc = "Goto Definition",
