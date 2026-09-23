@@ -1,18 +1,20 @@
-local uname = vim.uv.os_uname()
--- Mason has no Linux arm64 builds of selene or clangd.
-local linux_arm64 = uname.sysname == "Linux" and (uname.machine == "aarch64" or uname.machine == "arm64")
-
 return {
 	{
 		"mason-org/mason.nvim",
-		opts = {
-			ensure_installed = { "luacheck", "shellcheck", not linux_arm64 and "selene" or nil },
-		},
+		opts = function(_, opts)
+			vim.list_extend(opts.ensure_installed, {
+				"stylua",
+				"selene",
+				"luacheck",
+				"shellcheck",
+				"shfmt",
+				"tailwindcss-language-server",
+				"typescript-language-server",
+				"css-lsp",
+			})
+		end,
 	},
-	{
-		"mfussenegger/nvim-lint",
-		opts = { linters_by_ft = { lua = { linux_arm64 and "luacheck" or "selene" } } },
-	},
+
 	{
 		"neovim/nvim-lspconfig",
 		opts = {
@@ -25,7 +27,7 @@ return {
 						return require("lspconfig.util").root_pattern(".git")(...)
 					end,
 				},
-				ts_ls = {
+				tsserver = {
 					root_dir = function(...)
 						return require("lspconfig.util").root_pattern(".git")(...)
 					end,
@@ -125,29 +127,6 @@ return {
 						},
 					},
 				},
-				gopls = {
-					settings = {
-						gopls = {
-							analyses = {
-								unusedparams = true,
-								shadow = true,
-							},
-							staticcheck = true,
-						},
-					},
-				},
-				clangd = {
-					mason = not linux_arm64,
-					cmd = { "clangd", "--background-index" },
-					filetypes = { "c", "cpp", "objc", "objcpp" },
-					root_dir = function(...)
-						return require("lspconfig.util").root_pattern(
-							"compile_commands.json",
-							"compile_flags.txt",
-							".git"
-						)(...)
-					end,
-				},
 			},
 			setup = {},
 		},
@@ -167,15 +146,5 @@ return {
 				},
 			})
 		end,
-	},
-	{
-		"MeanderingProgrammer/render-markdown.nvim",
-		cmd = { "RenderMarkdown" },
-		ft = { "markdown", "mdx" },
-		dependencies = {
-			"nvim-treesitter/nvim-treesitter",
-			"nvim-mini/mini.icons",
-		},
-		opts = {},
 	},
 }

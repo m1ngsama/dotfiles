@@ -1,8 +1,12 @@
 local M = {}
+local LazyvimUtil = require("lazyvim.util")
 
 function M.toggleInlayHints()
-	local filter = { bufnr = 0 }
-	vim.lsp.inlay_hint.enable(not vim.lsp.inlay_hint.is_enabled(filter), filter)
+	vim.lsp.inlay_hint.enable(not vim.lsp.inlay_hint.is_enabled())
+end
+
+function M.toggleAutoformat()
+	LazyvimUtil.format.toggle()
 end
 
 return M
