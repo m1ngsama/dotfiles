@@ -1,8 +1,2 @@
-* text=auto
-
-*.fish text eol=lf
-*.lua text eol=lf
-*.sh text eol=lf
-*.toml text eol=lf
-*.yml text eol=lf
+* text=auto eol=lf
 *.reg text eol=crlf

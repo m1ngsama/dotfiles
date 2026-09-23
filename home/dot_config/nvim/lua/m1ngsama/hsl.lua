@@ -1,5 +1,4 @@
--- RGB/HSL math adapted from Emmanuel Oga's columns project (CC BY 3.0).
--- Provenance and local modifications: third_party/hsl-color/UPSTREAM.toml
+-- RGB/HSL math adapted from Emmanuel Oga's columns project (CC BY 3.0, see third_party/hsl-color/LICENSE).
 
 local M = {}
 
@@ -160,15 +159,12 @@ function M.replace_hex_colors(line)
 end
 
 function M.replaceHexWithHSL()
-	-- Get the current line number
 	local line_number = vim.api.nvim_win_get_cursor(0)[1]
 
-	-- Get the line content
 	local line_content = vim.api.nvim_buf_get_lines(0, line_number - 1, line_number, false)[1]
 
 	line_content = M.replace_hex_colors(line_content)
 
-	-- Set the line content back
 	vim.api.nvim_buf_set_lines(0, line_number - 1, line_number, false, { line_content })
 end
 

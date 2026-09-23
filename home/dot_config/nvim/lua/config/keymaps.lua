@@ -1,7 +1,3 @@
-local discipline = require("m1ngsama.discipline")
-
--- discipline.cowboy()
-
 local keymap = vim.keymap
 local opts = { noremap = true, silent = true }
 
@@ -28,9 +24,6 @@ keymap.set("n", "dw", 'vb"_d')
 
 -- Select all
 keymap.set("n", "<C-a>", "gg<S-v>G")
-
--- Save with root permission (not working for now)
---vim.api.nvim_create_user_command('W', 'w !sudo tee > /dev/null %', {})
 
 -- Disable continuations
 keymap.set("n", "<Leader>o", "o<Esc>^Da", opts)

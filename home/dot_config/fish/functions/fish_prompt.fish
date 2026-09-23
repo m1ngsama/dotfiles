@@ -1,6 +1,5 @@
 function fish_prompt --description 'M1NGSAMA prompt'
     set -l last_status $status
-    # Solarized Osaka palette from locked commit f796014c14b1910e08d42cc2077fef34f08e0295.
     set -l osaka_red db302d
     set -l osaka_magenta d23681
     set -l osaka_blue 268bd3
@@ -11,7 +10,6 @@ function fish_prompt --description 'M1NGSAMA prompt'
     set -l marker_color $osaka_green
     if test $last_status -ne 0
         set marker_color $osaka_red
-        # The marker and status number remain meaningful without colour.
         set_color --bold $osaka_red
         printf '!%d ' $last_status
     end
@@ -27,8 +25,6 @@ function fish_prompt --description 'M1NGSAMA prompt'
     printf '%s' (prompt_pwd)
 
     if command -q git
-        # One porcelain-v2 query provides both branch and worktree state. This
-        # avoids spawning three Git processes on every prompt refresh.
         set -l git_status (command git --no-optional-locks status \
             --porcelain=v2 --branch \
             --ignore-submodules=dirty --untracked-files=no \
