@@ -1,3 +1,10 @@
+local function git_root(bufnr, on_dir)
+	local root = vim.fs.root(bufnr, ".git")
+	if root then
+		on_dir(root)
+	end
+end
+
 return {
 	{
 		"mason-org/mason.nvim",
@@ -9,7 +16,6 @@ return {
 				"shellcheck",
 				"shfmt",
 				"tailwindcss-language-server",
-				"typescript-language-server",
 				"css-lsp",
 			})
 		end,
@@ -21,38 +27,44 @@ return {
 			inlay_hints = { enabled = false },
 			---@type lspconfig.options
 			servers = {
+				["*"] = {
+					keys = {
+						{
+							"gd",
+							function()
+								require("telescope.builtin").lsp_definitions({ reuse_win = false })
+							end,
+							desc = "Goto Definition",
+							has = "definition",
+						},
+					},
+				},
 				cssls = {},
 				tailwindcss = {
-					root_dir = function(...)
-						return require("lspconfig.util").root_pattern(".git")(...)
-					end,
+					root_dir = git_root,
 				},
-				tsserver = {
-					root_dir = function(...)
-						return require("lspconfig.util").root_pattern(".git")(...)
-					end,
-					single_file_support = false,
+				vtsls = {
+					root_dir = git_root,
+					workspace_required = true,
 					settings = {
 						typescript = {
 							inlayHints = {
-								includeInlayParameterNameHints = "literal",
-								includeInlayParameterNameHintsWhenArgumentMatchesName = false,
-								includeInlayFunctionParameterTypeHints = true,
-								includeInlayVariableTypeHints = false,
-								includeInlayPropertyDeclarationTypeHints = true,
-								includeInlayFunctionLikeReturnTypeHints = true,
-								includeInlayEnumMemberValueHints = true,
+								parameterNames = { enabled = "literals", suppressWhenArgumentMatchesName = true },
+								parameterTypes = { enabled = true },
+								variableTypes = { enabled = false },
+								propertyDeclarationTypes = { enabled = true },
+								functionLikeReturnTypes = { enabled = true },
+								enumMemberValues = { enabled = true },
 							},
 						},
 						javascript = {
 							inlayHints = {
-								includeInlayParameterNameHints = "all",
-								includeInlayParameterNameHintsWhenArgumentMatchesName = false,
-								includeInlayFunctionParameterTypeHints = true,
-								includeInlayVariableTypeHints = true,
-								includeInlayPropertyDeclarationTypeHints = true,
-								includeInlayFunctionLikeReturnTypeHints = true,
-								includeInlayEnumMemberValueHints = true,
+								parameterNames = { enabled = "all", suppressWhenArgumentMatchesName = true },
+								parameterTypes = { enabled = true },
+								variableTypes = { enabled = true },
+								propertyDeclarationTypes = { enabled = true },
+								functionLikeReturnTypes = { enabled = true },
+								enumMemberValues = { enabled = true },
 							},
 						},
 					},
@@ -77,8 +89,7 @@ return {
 								callSnippet = "Both",
 							},
 							misc = {
-								parameters = {
-								},
+								parameters = {},
 							},
 							hint = {
 								enable = true,
@@ -130,21 +141,5 @@ return {
 			},
 			setup = {},
 		},
-	},
-	{
-		"neovim/nvim-lspconfig",
-		opts = function()
-			local keys = require("lazyvim.plugins.lsp.keymaps").get()
-			vim.list_extend(keys, {
-				{
-					"gd",
-					function()
-						require("telescope.builtin").lsp_definitions({ reuse_win = false })
-					end,
-					desc = "Goto Definition",
-					has = "definition",
-				},
-			})
-		end,
 	},
 }
