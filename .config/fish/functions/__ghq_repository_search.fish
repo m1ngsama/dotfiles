@@ -1,4 +1,4 @@
-function __m1ng_ghq_repository_search --description 'Select a ghq repository with fzf'
+function __ghq_repository_search --description 'Select a ghq repository with fzf'
     if not command -q ghq; or not command -q fzf
         printf 'ghq repository search requires both ghq and fzf\n' >&2
         return 127
