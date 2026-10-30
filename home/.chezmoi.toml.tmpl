@@ -1,8 +1,0 @@
-{{- $linuxX11 := false -}}
-{{- if eq .chezmoi.os "linux" -}}
-{{-   $linuxX11 = promptBoolOnce . "profiles.linuxX11" "Enable the i3/X11 profile" -}}
-{{- end -}}
-sourceDir = {{ .chezmoi.workingTree | quote }}
-
-[data.profiles]
-linuxX11 = {{ $linuxX11 }}
